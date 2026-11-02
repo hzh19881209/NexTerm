@@ -1,0 +1,32 @@
+{
+  "name": "nexterm",
+  "version": "0.1.0",
+  "private": true,
+  "description": "A mobile-friendly web SSH and SFTP workspace",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js",
+    "postinstall": "node scripts/copy-vendor.js",
+    "admin:reset": "node scripts/reset-admin.js",
+    "security:audit": "npm audit --omit=dev --audit-level=high",
+    "security:smoke": "node scripts/security-smoke-test.js",
+    "test:terminal": "node --test scripts/terminal-screen-test.js",
+    "security:check": "node --check server.js && node --check public/app.js && npm run test:terminal && npm run security:smoke && npm run security:audit"
+  },
+  "dependencies": {
+    "@xterm/addon-fit": "^0.10.0",
+    "@xterm/addon-serialize": "0.13.0",
+    "@xterm/headless": "5.5.0",
+    "@xterm/xterm": "^5.5.0",
+    "body-parser": "^1.20.8",
+    "express": "^4.22.3",
+    "multer": "^2.4.0",
+    "proxy-addr": "^2.0.8",
+    "qrcode": "^1.5.4",
+    "qs": "^6.16.1",
+    "ssh2": "^1.16.0",
+    "ssh2-sftp-client": "^11.0.0",
+    "ws": "^8.18.0"
+  }
+}

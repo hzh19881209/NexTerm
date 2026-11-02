@@ -1,0 +1,8 @@
+.codegraph/
+node_modules/
+data/*.json
+public/vendor/
+.env
+*.log
+certs/*.key
+certs/*.crt
