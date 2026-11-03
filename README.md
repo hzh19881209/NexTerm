@@ -84,7 +84,7 @@ npm run dev
 
 - `approve_once` → 按 1（Yes, proceed）
 - `approve_always` → 按 2（Yes, and don't ask again）
-- `deny` → 按 3（No, and tell Codex what to do differently）
+- `deny` → 不按任何键，交回人工处理（模型只是「建议拒绝」，不替你按 3；保留你的选择权，你可在终端按 1/2/3 自行决定，系统会记录你实际按下的选项）
 - `unsafe` / `unknown` → 不按任何键，交回人工处理
 
 判定只看「待确认提示及其要执行的命令」这一段：服务端会从画面里抽出待确认提示和它要执行的命令（命令过长换行也会向上合并），整屏其他命令与历史输出只作为参考，避免模型因为画面里别处出现过 `rm -rf` 就误判。命令名只是触发词，最终按作用对象判定：删除 `/tmp`、`/var/tmp`、`~/.cache`、`dist`/`build`/`node_modules` 等临时或可再生位置属于低风险，直接按 1；只有删除 `/`、`~`、`/home`、`/data`、数据库或备份目录、密钥目录等真实数据，或范围看不清时才交回人工。

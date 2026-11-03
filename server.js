@@ -1208,8 +1208,7 @@ app.get('/api/approval-history', auth, passwordChanged, (req, res) => {
         time: item.time, type: item.type, message: item.message,
         choice: String(details.choice || ''), risk: String(details.risk || ''), reason: String(details.reason || ''),
         promptKey: String(details.promptKey || ''), promptBlock: String(details.promptBlock || '').slice(0, 600),
-        serverId: String(details.serverId || ''),
-        keys: String(details.keys || '')
+        serverId: String(details.serverId || '')
       });
       if (decisions.length >= 50) break;
     }
@@ -1565,6 +1564,23 @@ function rememberOutput(session, data) {
       session.stream?.resume(); session.stream?.stderr?.resume();
     }
     if (session.approval?.enabled) scheduleApprovalScan(session);
+    // A high-risk / deny prompt may still be waiting on the human. If the
+    // terminal has moved past the input prompt for a few stable frames, mark
+    // the record resolved so it does not linger forever (the user either
+    // cancelled or the prompt was answered without a recognizable key).
+    if (session.approvalHighRiskPrompt && !sessionPromptState(session).inputRequired) {
+      session.approvalHumanGoneFrames = (session.approvalHumanGoneFrames || 0) + 1;
+      if (session.approvalHumanGoneFrames >= 3) {
+        const account = users.find((item) => item.id === session.ownerId);
+        resolveHighRiskEntry(account, session.approvalHighRiskPrompt.promptKey, '', '提示已消失', '用户未在终端选择，提示已消失');
+        auditEvent('approval.high_risk_unresolved', null, account || null, '提示已消失：用户未选择', { sessionId:session.id, promptKey:session.approvalHighRiskPrompt.promptKey });
+        approvalSend(session, { action:'resolved', promptKey:session.approvalHighRiskPrompt.promptKey, reason:'prompt-gone' });
+        session.approvalHighRiskPrompt = null;
+        session.approvalHumanGoneFrames = 0;
+      }
+    } else {
+      session.approvalHumanGoneFrames = 0;
+    }
   });
 }
 // --- AI approval assistant: server-side prompt detection --------------------
@@ -1659,7 +1675,7 @@ function approvalWriteKeys(session, keys, label) {
 // The key is the internal code; the value tells the user *why* it stopped, so
 // a silent stop (e.g. "the model refused") is never a mystery again.
 const APPROVAL_STOP_REASONS = {
-  deny_unverified: '模型判定为「拒绝」，但当前画面无法确认确认菜单结构（未找到 “1. Yes, proceed”），为避免误按已停止，需人工核对后手动选择。',
+  deny: '模型判定为「拒绝」，已停止自动审批并交回人工，请在终端中自行选择（按 1/2/3 等）。',
   unsafe: '模型判定该操作为高危/危险，已停止自动审批并交回人工，请在终端手动选择。',
   unknown: '模型无法判断该操作是否安全，已停止自动审批并交回人工处理。',
   model_error: '审批模型调用失败（网络/超时/返回内容无法解析），重试达到上限后已停止，已交回人工处理。',
@@ -1680,12 +1696,10 @@ function stopSessionApproval(session, reason = 'stopped') {
   session.approvalPending = null;
   session.approvalFrames = 0;
   session.approvalLastScreen = '';
-  if (session.approvalHighRiskPrompt && session.ownerId) {
-    const account = users.find((item) => item.id === session.ownerId);
-    resolveHighRiskEntry(account, session.approvalHighRiskPrompt.promptKey, '', '已停止自动审批', '自动审批已停止，提示未处理');
-    auditEvent('approval.high_risk_unresolved', null, account || null, '高危提示未处理：自动审批已停止', { sessionId:session.id, promptKey:session.approvalHighRiskPrompt.promptKey });
-  }
-  session.approvalHighRiskPrompt = null;
+  // A high-risk / deny prompt is still waiting on the human, so keep the
+  // terminal key watcher armed: record whichever menu option the user actually
+  // presses (or mark it resolved later when the prompt disappears). Do not
+  // resolve the entry or drop the prompt here.
   if (session.ownerId) {
     const stopAccount = users.find((item) => item.id === session.ownerId);
     auditEvent('approval.stopped', null, stopAccount || null, `自动审批已停止：${approvalStopReasonLabel(reason)}`, { sessionId: session.id, serverId: session.serverId, reason });
@@ -1767,7 +1781,10 @@ async function evaluateSessionApproval(session) {
     : decision.choice === 'approve_always' ? '2 Yes, and don\'t ask again'
     : decision.choice === 'deny' ? '3 No, tell it what to do differently'
     : decision.choice === 'unsafe' ? '交回人工（判定为危险）' : '交回人工（无法判断）';
-  if (decision.choice === 'unsafe' || decision.risk === 'high' || decision.risk === 'critical') {
+  // `deny` also hands the prompt to the human (it no longer presses "No"), so
+  // it records a high-risk entry and arms the key watcher to store whatever the
+  // user actually presses.
+  if (decision.choice === 'unsafe' || decision.choice === 'deny' || decision.risk === 'high' || decision.risk === 'critical') {
     const entry = { id: id(), time: now(), block: String(state.block || '').replace(/\s+\n/g, '\n').trim().slice(-APPROVAL_HIGH_RISK_CONTEXT_BYTES), screen: String(screen || '').replace(/\s+\n/g, '\n').trim().slice(-APPROVAL_HIGH_RISK_CONTEXT_BYTES), choice: decision.choice, risk: decision.risk, modelReason: String(decision.reason || '').slice(0, 400), promptKey, humanChoice: '', humanChoiceLabel: '', humanChoiceReason: '', resolvedAt: '' };
     if (!account.approvalHighRisk || typeof account.approvalHighRisk !== 'object') account.approvalHighRisk = { items: [] };
     account.approvalHighRisk.items = [entry, ...(account.approvalHighRisk.items || [])].slice(0, APPROVAL_HIGH_RISK_MAX);
@@ -1795,17 +1812,14 @@ async function evaluateSessionApproval(session) {
     return scheduleApprovalScan(session, 1500);
   }
   if (decision.choice === 'deny') {
-    // Codex leaves the cursor on option 1, so option 3 needs two down arrows
-    // before Enter. Sending Enter blindly would approve instead of deny, so
-    // hand ambiguous cases back to the human rather than guessing.
-    if (!/1\.\s*Yes, proceed/i.test(screen)) {
-      approvalSend(session, { action:'need_human', promptKey, choice:decision.choice, risk:decision.risk, reason:decision.reason, message:'模型建议拒绝，但菜单结构无法确认，已交回人工处理' });
-      return stopSessionApproval(session, 'deny_unverified');
-    }
-    if (!approvalWriteKeys(session, '\u001b[B\u001b[B\r', label)) return stopSessionApproval(session, 'write-failed');
-    approvalSend(session, { action:'acted', promptKey, choice:decision.choice, risk:decision.risk, reason:decision.reason, label });
-    session.approvalLastScreen = ''; session.approvalFrames = 0;
-    return scheduleApprovalScan(session, 1500);
+    // The model recommends refusing. Do NOT press the "No" key on the user's
+    // behalf: that would end the Codex turn and remove the user's chance to
+    // proceed or answer (the user would have to start the session over).
+    // Instead hand the prompt back to the human and let the key watcher record
+    // whichever option they actually press (approvalHighRiskPrompt was armed
+    // above for the `deny` case).
+    approvalSend(session, { action:'need_human', promptKey, choice:decision.choice, risk:decision.risk, reason:decision.reason, highRisk:true, pending: Boolean(session.approvalHighRiskPrompt), message:'模型建议拒绝，已交回人工处理，请在终端中自行选择（如按 1/2/3）' });
+    return stopSessionApproval(session, 'deny');
   }
   // unsafe / unknown: never press a key; hand control back to the human.
   const highRisk = decision.choice === 'unsafe' || decision.risk === 'high' || decision.risk === 'critical';

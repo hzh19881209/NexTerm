@@ -1819,9 +1819,9 @@
     { label:'vLLM', baseUrl:'http://127.0.0.1:8000/v1', model:'<vLLM 服务模型>' },
     { label:'OpenAI', baseUrl:'https://api.openai.com/v1', model:'gpt-4o-mini' }
   ];
-  const APPROVAL_CHOICE_LABELS = { approve_once:'按 1（本次批准）', approve_always:'按 2（不再询问）', deny:'按 3（拒绝）', unsafe:'交回人工（危险）', unknown:'交回人工（不确定）' };
+  const APPROVAL_CHOICE_LABELS = { approve_once:'按 1（本次批准）', approve_always:'按 2（不再询问）', deny:'交回人工（建议拒绝）', unsafe:'交回人工（危险）', unknown:'交回人工（不确定）' };
   const APPROVAL_STOP_LABELS = {
-    deny_unverified: '模型判定为「拒绝」，但画面无法确认确认菜单结构，为避免误按已停止',
+    deny: '模型判定为「拒绝」，已停止并交回人工，请在终端自行选择',
     unsafe: '模型判定该操作为高危/危险，已停止并交回人工',
     unknown: '模型无法判断该操作是否安全，已停止并交回人工',
     model_error: '审批模型调用失败（网络/超时/返回无法解析），重试达到上限后已停止',
@@ -1848,7 +1848,7 @@
       const closeEditor = () => { editor.innerHTML = ''; editor.dataset.editing = ''; };
       const renderList = () => {
         const currentDefault = state.user?.preferences?.approvalDefaultModelId || '';
-        list.innerHTML = models.length ? models.map((model) => `<div class="approval-item${model.enabled === false ? ' disabled' : ''}${model.id === currentDefault ? ' is-default' : ''}" data-approval-item="${model.id}"><div class="approval-item-main"><strong>${escapeHtml(model.name)}${model.id === currentDefault ? ' <span class="approval-default-tag">（默认）</span>' : ''}</strong><small>${escapeHtml(model.baseUrl)} · ${escapeHtml(model.model)}</small><small>${model.hasKey ? `密钥 ${escapeHtml(model.keyHint)}` : '未设置密钥'}${model.enabled === false ? ' · 已停用' : ''}</small></div><div class="approval-item-actions"><button type="button" class="secondary" data-default="${model.id}" data-is-default="${model.id === currentDefault ? '1' : '0'}">${model.id === currentDefault ? '取消默认' : '设为默认'}</button><button type="button" class="secondary" data-test="${model.id}">测试</button><button type="button" class="secondary" data-edit="${model.id}">编辑</button><button type="button" class="secondary danger" data-delete="${model.id}">删除</button></div><div class="approval-test-result" data-test-result="${model.id}"></div></div>`).join('') : '<div class="empty">还没有审批模型。点击「添加模型」接入 TokenMeter 或 LM Studio。</div>';
+        list.innerHTML = models.length ? models.map((model) => `<div class="approval-item${model.enabled === false ? ' disabled' : ''}${model.id === currentDefault ? ' is-default' : ''}" data-approval-item="${model.id}"><div class="approval-item-main"><strong>${escapeHtml(model.name)}${model.id === currentDefault ? ' <span class="approval-default-tag">（默认）</span>' : ''}</strong><small>${escape(maskApprovalSecrets(model.baseUrl))} · ${escape(maskApprovalSecrets(model.model))}</small><small>${model.hasKey ? `密钥已隐藏` : '未设置密钥'}${model.enabled === false ? ' · 已停用' : ''}</small></div><div class="approval-item-actions"><button type="button" class="secondary" data-default="${model.id}" data-is-default="${model.id === currentDefault ? '1' : '0'}">${model.id === currentDefault ? '取消默认' : '设为默认'}</button><button type="button" class="secondary" data-test="${model.id}">测试</button><button type="button" class="secondary" data-edit="${model.id}">编辑</button><button type="button" class="secondary danger" data-delete="${model.id}">删除</button></div><div class="approval-test-result" data-test-result="${model.id}"></div></div>`).join('') : '<div class="empty">还没有审批模型。点击「添加模型」接入 TokenMeter 或 LM Studio。</div>';
         renderDefault();
       };
       const renderDefault = () => {
@@ -1863,7 +1863,7 @@
         if (!status) return;
         const model = models.find((m) => m.id === modelId);
         if (!modelId) { status.textContent = '当前为自动选择（列表中的第一个已启用模型）'; status.classList.remove('is-active'); return; }
-        status.textContent = `当前默认：${model ? model.name : modelId}`;
+        status.textContent = `当前默认：${maskApprovalSecrets(model ? model.name : modelId)}`;
         status.classList.add('is-active');
         if (changed) { status.classList.remove('just-set'); void status.offsetWidth; status.classList.add('just-set'); setTimeout(() => status.classList.remove('just-set'), 900); }
       };
@@ -1990,7 +1990,7 @@
     if (!value) return value;
     let masked = value.replace(/\bBearer\s+[A-Za-z0-9\-_.~+\/]+={0,2}/gi, 'Bearer ••••（已隐藏）');
     masked = masked.replace(/\b(?:sk|pk|gsk)_[A-Za-z0-9]{8,}/g, '••••（已隐藏）');
-    masked = masked.replace(/\b[A-Za-z0-9]{32,}/g, '••••（已隐藏）');
+    masked = masked.replace(/\b[A-Za-z0-9]{16,}/g, '••••（已隐藏）');
     masked = masked.replace(/(?<=[?:=])\s*['"]?[A-Za-z0-9+/=_\-]{20,}['"]?/g, '••••（已隐藏）');
     return masked;
   };
@@ -2026,9 +2026,9 @@
       const stopLabel = approvalStopLabel(stopReason, stopMessage);
       $('[data-history-stop]', backdrop).innerHTML = live
         ? (liveEnabled
-            ? `<div class="approval-history-item"><div class="approval-history-item-head"><span>${escape(stopHost)}</span><span class="risk-tag risk-low">运行中</span></div><small>自动审批当前已开启${stopModel ? `（${escape(stopModel)}）` : ''}。</small></div>`
+            ? `<div class="approval-history-item"><div class="approval-history-item-head"><span>${escape(stopHost)}</span><span class="risk-tag risk-low">运行中</span></div><small>自动审批当前已开启${stopModel ? `（${escape(maskApprovalSecrets(stopModel))}）` : ''}。</small></div>`
             : stopReason
-              ? `<div class="approval-history-item"><div class="approval-history-item-head"><span>${escape(stopHost)}</span><span class="risk-tag risk-medium">已停止</span></div><small>${escape(stopLabel)}</small>${stopModel ? `<small>使用模型：${escape(stopModel)}${stopRememberAll ? ' · 已记住同类操作' : ''}</small>` : ''}<div class="approval-history-actions"><button type="button" class="primary" data-rearm-approval>重新开启自动审批</button><button type="button" class="secondary" data-approval-settings>更换/配置模型</button></div></div>`
+              ? `<div class="approval-history-item"><div class="approval-history-item-head"><span>${escape(stopHost)}</span><span class="risk-tag risk-medium">已停止</span></div><small>${escape(stopLabel)}</small>${stopModel ? `<small>使用模型：${escape(maskApprovalSecrets(stopModel))}${stopRememberAll ? ' · 已记住同类操作' : ''}</small>` : ''}<div class="approval-history-actions"><button type="button" class="primary" data-rearm-approval>重新开启自动审批</button><button type="button" class="secondary" data-approval-settings>更换/配置模型</button></div></div>`
               : '<div class="empty">该标签尚未触发过自动审批停止。</div>')
         : '<div class="empty">当前没有已连接的终端标签。</div>';
       const rearmBtn = $('[data-rearm-approval]', backdrop);
@@ -2038,7 +2038,7 @@
       const highRisk = Array.isArray(result.highRisk) ? result.highRisk : [];
       $('[data-history-high]', backdrop).innerHTML = highRisk.length ? highRisk.map((entry) => {
         const risk = entry.risk ? `<span class="risk-tag risk-${escape(entry.risk)}">${escape(RISK_LABELS[entry.risk] || entry.risk)}</span>` : '';
-        const model = entry.modelReason ? `<small>模型：${escape(choiceLabel(entry.choice, entry.modelReason))} · ${escape(entry.modelReason)}</small>` : '';
+        const model = entry.modelReason ? `<small>模型：${escape(maskApprovalSecrets(choiceLabel(entry.choice, entry.modelReason)))} · ${escape(maskApprovalSecrets(entry.modelReason))}</small>` : '';
         const human = entry.humanChoice
           ? `<small class="human-resolved">人工处理：${escape(entry.humanChoiceLabel || entry.humanChoice)}${entry.resolvedAt ? ` · ${escape(fmtTime(entry.resolvedAt))}` : ''}</small>`
           : `<small class="human-pending">人工处理：未记录${entry.resolvedAt ? ` · ${escape(fmtTime(entry.resolvedAt))}` : ''}</small>`;
@@ -2047,13 +2047,9 @@
       const decisions = Array.isArray(result.decisions) ? result.decisions : [];
       $('[data-history-decisions]', backdrop).innerHTML = decisions.length ? decisions.map((item) => {
         const risk = item.risk ? `<span class="risk-tag risk-${escape(item.risk)}">${escape(RISK_LABELS[item.risk] || item.risk)}</span>` : '';
-        const rawKeys = item.keys ? JSON.parse(String(item.keys).slice(0, 400) || 'null') : null;
-        const keySummary = Array.isArray(rawKeys) && rawKeys.length
-          ? rawKeys.map((code) => code === '\r' ? 'Enter ↵' : code === '\u001b[B' ? '↓' : code === '\u001b[A' ? '↑' : code === '\u001b[C' ? '→' : code === '\u001b[D' ? '←' : `按键 ${JSON.stringify(code)}`).join(' ')
-          : '';
         const summary = item.type === 'approval.auto_key'
-          ? `自动执行：${escape(maskApprovalSecrets(item.message || ''))}${keySummary ? ` · ${escape(keySummary)}` : ''}`
-          : `模型决定：${escape(choiceLabel(item.choice, item.reason))}${item.reason ? ` · ${escape(maskApprovalSecrets(item.reason))}` : ''}`;
+          ? `自动执行：${escape(maskApprovalSecrets(item.message || ''))}`
+          : `模型决定：${escape(maskApprovalSecrets(choiceLabel(item.choice, item.reason)))}${item.reason ? ` · ${escape(maskApprovalSecrets(item.reason))}` : ''}`;
         return `<div class="approval-history-item"><div class="approval-history-item-head"><span>${escape(fmtTime(item.time))}</span>${risk}</div><small>${summary}</small>${blockHtml(item.promptBlock)}</div>`;
       }).join('') : '<div class="empty">暂无模型决定记录。</div>';
     })();
