@@ -1202,13 +1202,14 @@ app.get('/api/approval-history', auth, passwordChanged, (req, res) => {
     for (const line of lines) {
       let item; try { item = JSON.parse(line); } catch { continue; }
       if (item.userId !== account.id) continue;
-      if (item.type !== 'approval.decision' && item.type !== 'approval.auto_key') continue;
+      if (item.type !== 'approval.decision') continue;
       const details = item.details && typeof item.details === 'object' ? item.details : {};
       decisions.push({
         time: item.time, type: item.type, message: item.message,
         choice: String(details.choice || ''), risk: String(details.risk || ''), reason: String(details.reason || ''),
-        promptKey: String(details.promptKey || ''), promptBlock: String(details.promptBlock || details.keys || '').slice(0, 600),
-        serverId: String(details.serverId || '')
+        promptKey: String(details.promptKey || ''), promptBlock: String(details.promptBlock || '').slice(0, 600),
+        serverId: String(details.serverId || ''),
+        keys: String(details.keys || '')
       });
       if (decisions.length >= 50) break;
     }

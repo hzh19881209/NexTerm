@@ -1147,7 +1147,17 @@
     const codexReturnedIdle = tab.taskWasWorking && status.codexIdle;
     if (tab.id === state.activeTab) {
       if (newCompletion) tab.lastCompletionKey = status.completionKey;
-      if (inputRequired || newCompletion || codexReturnedIdle) tab.taskWasWorking = false;
+      if (inputRequired || newCompletion || codexReturnedIdle) {
+        tab.taskWasWorking = false;
+        // A finished session that returned to the idle prompt repaints most of
+        // the screen.  When the reader owns the view, re-assert the live tail so
+        // the new prompt renders immediately instead of waiting for F5.
+        // Only a finished session / fresh idle prompt needs the nudge: while the
+        // model auto-presses Enter an input prompt also matches this branch, and
+        // re-pinning the viewport on every one of those would cancel an in-flight
+        // scroll.  xterm already follows the live tail in the normal cases.
+        if (newCompletion || codexReturnedIdle) requestAnimationFrame(() => { if (tab.id === state.activeTab && !terminalUserScrolling(tab) && tab.followOutput !== false) tab.terminal?.scrollToBottom?.(); });
+      }
       clearTabAttention(tab);
       return;
     }
@@ -1273,7 +1283,8 @@
     const protocol = location.protocol === 'https:' ? 'wss' : 'ws'; const ws = new WebSocket(`${protocol}://${location.host}/ws`); const generation = ++tab.wsGeneration; tab.ws = ws;
     const isCurrentSocket = () => tab.ws === ws && tab.wsGeneration === generation;
     ws.onopen = () => { if (!isCurrentSocket()) return ws.close(); tab.reconnectAttempt = 0; if (tab.id === state.activeTab) fitTerminal(tab); const dimensions = tab.terminal ? { cols: tab.terminal.cols, rows: tab.terminal.rows } : {}; ws.send(JSON.stringify({ type:'connect', serverId:tab.serverId, sessionId:tab.id, lastSeq:tab.lastSeq, initialCwd:tab.initialCwd || '', tabName:tab.name || '', ...dimensions })); };
-    ws.onmessage = (event) => { if (!isCurrentSocket()) return; let message; try { message = JSON.parse(event.data); } catch { return; } if (message.type === 'connected') { if (!message.resumed && tab.lastSeq) tab.lastSeq = 0; tab.reconnectBlocked = false; state.takenOverTabs.delete(tab.id); refreshSessionTakeoverDialog(); tab.connected = true; if (!message.resumed) { if (tab.attentionTimer) clearTimeout(tab.attentionTimer); tab.attentionTimer = null; tab.taskWasWorking = false; tab.lastCompletionKey = ''; } tab.reconnectAttempt = 0; renderTabs(); refreshTabCwd(tab); if (tab.approvalEnabled) requestAnimationFrame(() => enableTabApproval(tab, { silent:true })); } else if (message.type === 'snapshot') { restoreTerminalSnapshot(tab, message, isCurrentSocket); } else if (message.type === 'output') { if (message.seq && message.seq <= tab.lastSeq) return; tab.lastSeq = Math.max(tab.lastSeq, Number(message.seq || 0)); const bytes = Uint8Array.from(atob(message.data), (char) => char.charCodeAt(0)); tab.terminal?.write(bytes, () => { if (!isCurrentSocket() || tab.restoring) return; scrollTerminalToBottom(tab); trackTabOutput(tab); }); } else if (message.type === 'cwd') { const pending = tab.cwdRequests?.get(message.requestId); if (!pending) return; clearTimeout(pending.timer); tab.cwdRequests.delete(message.requestId); const directory = String(message.path || ''); if (directory.startsWith('/')) { tab.currentDirectory = directory; persistSessions(); updateTabNames(); } pending.resolve(directory || tab.currentDirectory || tab.initialCwd || ''); } else if (message.type === 'approval') { handleApprovalMessage(tab, message); } else if (message.type === 'error') { tab.connected = false; tab.terminal?.write(`\r\n\x1b[31m${message.message}\x1b[0m\r\n`); notify(message.message, 'error'); renderTabs(); } else if (message.type === 'closed') { tab.connected = false; if (message.reason === 'remote-closed') { closeTab(tab.id); return; } renderTabs(); } };
+    // xterm follows the live tail on its own while the reader is not scrolling, so forcing the viewport to the bottom on every output frame would cancel an in-flight upward scroll and hide the newest frame (a finished Codex session, a fresh prompt) until the reader hits F5.  Re-assert it next frame, guarded by the user-scroll flag.
+    ws.onmessage = (event) => { if (!isCurrentSocket()) return; let message; try { message = JSON.parse(event.data); } catch { return; } if (message.type === 'connected') { if (!message.resumed && tab.lastSeq) tab.lastSeq = 0; tab.reconnectBlocked = false; state.takenOverTabs.delete(tab.id); refreshSessionTakeoverDialog(); tab.connected = true; if (!message.resumed) { if (tab.attentionTimer) clearTimeout(tab.attentionTimer); tab.attentionTimer = null; tab.taskWasWorking = false; tab.lastCompletionKey = ''; } tab.reconnectAttempt = 0; renderTabs(); refreshTabCwd(tab); if (tab.approvalEnabled) requestAnimationFrame(() => enableTabApproval(tab, { silent:true })); } else if (message.type === 'snapshot') { restoreTerminalSnapshot(tab, message, isCurrentSocket); } else if (message.type === 'output') { if (message.seq && message.seq <= tab.lastSeq) return; tab.lastSeq = Math.max(tab.lastSeq, Number(message.seq || 0)); const bytes = Uint8Array.from(atob(message.data), (char) => char.charCodeAt(0)); tab.terminal?.write(bytes, () => { if (!isCurrentSocket() || tab.restoring) return; trackTabOutput(tab); requestAnimationFrame(() => { if (!terminalUserScrolling(tab)) tab.terminal?.scrollToBottom?.(); }); }); } else if (message.type === 'cwd') { const pending = tab.cwdRequests?.get(message.requestId); if (!pending) return; clearTimeout(pending.timer); tab.cwdRequests.delete(message.requestId); const directory = String(message.path || ''); if (directory.startsWith('/')) { tab.currentDirectory = directory; persistSessions(); updateTabNames(); } pending.resolve(directory || tab.currentDirectory || tab.initialCwd || ''); } else if (message.type === 'approval') { handleApprovalMessage(tab, message); } else if (message.type === 'error') { tab.connected = false; tab.terminal?.write(`\r\n\x1b[31m${message.message}\x1b[0m\r\n`); notify(message.message, 'error'); renderTabs(); } else if (message.type === 'closed') { tab.connected = false; if (message.reason === 'remote-closed') { closeTab(tab.id); return; } renderTabs(); } };
     ws.onclose = (event) => { if (!isCurrentSocket()) return; tab.ws = null; tab.connected = false; tab.restoring = false; if (tab.terminal?.element) tab.terminal.element.style.visibility = ''; resolveCwdRequests(tab, tab.currentDirectory || tab.initialCwd || ''); renderTabs(); if (event.code === 4401) { clearClientSession(); return; } if (event.code === 4000) { tab.reconnectBlocked = true; showSessionTakeoverDialog(tab); return; } if (!tab.manualClose) scheduleReconnect(tab, event.code === 4402); };
     ws.onerror = () => { if (isCurrentSocket() && !tab.manualClose && tab.connected) notify('连接暂时中断，远端会话将保留并自动重连', 'error'); };
   }
@@ -1549,10 +1560,38 @@
       // - The follow flag is re-derived from the live viewport instead of from
       //   wheel-event timing, because macOS momentum phases, coalesced events
       //   and deltaMode differences make delta-based heuristics unreliable.
+      // - xterm hard-stops a negative scroll at the top of the scrollback.
+      //   Magic Mouse momentum keeps firing after that stop, and the leftover
+      //   events clamp the viewport back to the live tail - the "cannot scroll
+      //   up on a Magic Mouse" symptom.  A capture listener absorbs momentum
+      //   that has no scrollback left to consume and holds the position until
+      //   the flick is over, so the next frame cannot drag the view back.
       // The whole block must stay inside the "if (tab.terminal) {" that opens on
       // the appendChild line: a stray brace there silently turned all of this
       // into dead code and upward scrolling looked completely dead again.
+      const scrollState = { holdUntil:0, momentumPaused:false, pendingMomentum:0, momentumFrame:null };
+      const scrollHistoryDepth = () => {
+        const buffer = tab.terminal?.buffer?.active;
+        if (!buffer) return 0;
+        return Math.max(0, Number(buffer.ybase) - Number(buffer.viewportY));
+      };
+      const scheduleMomentum = () => {
+        if (scrollState.momentumFrame) return;
+        scrollState.momentumFrame = requestAnimationFrame(() => {
+          scrollState.momentumFrame = null;
+          if (!scrollState.momentumPaused) { scrollState.pendingMomentum = 0; return; }
+          const amount = Math.round(scrollState.pendingMomentum / 6);
+          if (amount) { tab.terminal?.scrollLines?.(-amount); scrollState.pendingMomentum -= amount * 6; }
+          if (scrollState.pendingMomentum && scrollHistoryDepth() > 0) { scheduleMomentum(); return; }
+          // The whole flick cannot be shown: keep the view where it is instead
+          // of letting xterm re-clamp it to the tail on the next frame.
+          if (scrollState.pendingMomentum && terminalAtBottom(tab)) tab.terminal?.scrollLines?.(-1);
+          scrollState.pendingMomentum = 0;
+          scrollState.holdUntil = Date.now() + 900;
+        });
+      };
       const syncTerminalFollowFromViewport = () => {
+        if (Date.now() < scrollState.holdUntil) return;
         const following = terminalAtBottom(tab);
         tab.followOutput = following;
         if (following && !tab.restoring && tab.id === state.activeTab && !terminalUserScrolling(tab)) tab.terminal?.scrollToBottom?.();
@@ -1571,7 +1610,18 @@
           // the reader taking control. macOS momentum keeps firing after the
           // gesture ends, so follow must not be re-derived from delta signs.
           tab.followOutput = event.deltaY > 0 && terminalAtBottom(tab);
-        }, { capture:true, passive:true });
+          if (event.deltaY >= 0 || !terminalUsesMouseReporting(tab)) return;
+          // Terminal mouse reporting (Codex, htop, less) owns the viewport, so
+          // native scrolling stays the normal path there.
+          if (scrollState.momentumPaused) { scrollState.pendingMomentum += event.deltaY; scheduleMomentum(); return; }
+          if (scrollHistoryDepth() <= 0) {
+            scrollState.momentumPaused = true;
+            scrollState.pendingMomentum = event.deltaY;
+            event.preventDefault();
+            event.stopImmediatePropagation();
+            scheduleMomentum();
+          }
+        }, { capture:true, passive:false });
       };
       attachViewportFollow();
       tab.terminal.onScroll(() => { attachViewportFollow(); syncTerminalFollowFromViewport(); });
@@ -1932,6 +1982,18 @@
       renderList();
     })();
   }
+  // Upstream API keys can appear in the captured prompt block when a model is
+  // configured with credentials embedded in its Base URL. Never echo them back
+  // to the browser in the approval history.
+  const maskApprovalSecrets = (text) => {
+    const value = String(text || '');
+    if (!value) return value;
+    let masked = value.replace(/\bBearer\s+[A-Za-z0-9\-_.~+\/]+={0,2}/gi, 'Bearer ••••（已隐藏）');
+    masked = masked.replace(/\b(?:sk|pk|gsk)_[A-Za-z0-9]{8,}/g, '••••（已隐藏）');
+    masked = masked.replace(/\b[A-Za-z0-9]{32,}/g, '••••（已隐藏）');
+    masked = masked.replace(/(?<=[?:=])\s*['"]?[A-Za-z0-9+/=_\-]{20,}['"]?/g, '••••（已隐藏）');
+    return masked;
+  };
   function openApprovalHistoryModal() {
     const backdrop = document.createElement('div');
     backdrop.className = 'modal-backdrop';
@@ -1945,7 +2007,7 @@
     const blockHtml = (block) => {
       const text = String(block || '').trim();
       if (!text) return '';
-      return `<details class="approval-history-block"><summary>待确认内容</summary><pre>${escape(text.slice(0, 1200))}</pre></details>`;
+      return `<details class="approval-history-block"><summary>待确认内容</summary><pre>${escape(maskApprovalSecrets(text.slice(0, 1200)))}</pre></details>`;
     };
     void (async () => {
       let result;
@@ -1985,9 +2047,13 @@
       const decisions = Array.isArray(result.decisions) ? result.decisions : [];
       $('[data-history-decisions]', backdrop).innerHTML = decisions.length ? decisions.map((item) => {
         const risk = item.risk ? `<span class="risk-tag risk-${escape(item.risk)}">${escape(RISK_LABELS[item.risk] || item.risk)}</span>` : '';
+        const rawKeys = item.keys ? JSON.parse(String(item.keys).slice(0, 400) || 'null') : null;
+        const keySummary = Array.isArray(rawKeys) && rawKeys.length
+          ? rawKeys.map((code) => code === '\r' ? 'Enter ↵' : code === '\u001b[B' ? '↓' : code === '\u001b[A' ? '↑' : code === '\u001b[C' ? '→' : code === '\u001b[D' ? '←' : `按键 ${JSON.stringify(code)}`).join(' ')
+          : '';
         const summary = item.type === 'approval.auto_key'
-          ? `自动执行：${escape(item.message || '')}`
-          : `模型决定：${escape(choiceLabel(item.choice, item.reason))}${item.reason ? ` · ${escape(item.reason)}` : ''}`;
+          ? `自动执行：${escape(maskApprovalSecrets(item.message || ''))}${keySummary ? ` · ${escape(keySummary)}` : ''}`
+          : `模型决定：${escape(choiceLabel(item.choice, item.reason))}${item.reason ? ` · ${escape(maskApprovalSecrets(item.reason))}` : ''}`;
         return `<div class="approval-history-item"><div class="approval-history-item-head"><span>${escape(fmtTime(item.time))}</span>${risk}</div><small>${summary}</small>${blockHtml(item.promptBlock)}</div>`;
       }).join('') : '<div class="empty">暂无模型决定记录。</div>';
     })();
