@@ -6,3 +6,4 @@ public/vendor/
 *.log
 certs/*.key
 certs/*.crt
+scripts/github-release.sh
