@@ -139,7 +139,8 @@
       tab.terminal.options.fontSize = terminalFontSize;
       if (tab.id === state.activeTab) setTimeout(() => {
         if (!tab.view?.classList.contains('hidden')) {
-          scheduleTerminalFit(tab); tab.terminal.refresh(0, Math.max(0, tab.terminal.rows - 1)); scrollTerminalToBottom(tab);
+          scheduleTerminalFit(tab);
+          if (tab.followOutput !== false) { tab.terminal.refresh(0, Math.max(0, tab.terminal.rows - 1)); scrollTerminalToBottom(tab); }
         }
       }, 0);
     });
@@ -153,7 +154,7 @@
     const style = serverColor ? ` style="--connection-color:${serverColor}"` : '';
     return `<svg class="connection-icon ${connected ? 'connected' : 'disconnected'}${attention ? ' attention' : ''}${auto ? ' auto' : ''}${serverColor ? ' has-server-color' : ''}"${style} viewBox="0 0 24 24" role="img" aria-label="${auto ? '自动审批已开启（点击关闭）' : '点击开启自动审批'}"><path class="connection-bolt" d="M13.7 2.5 5.4 13.3h6.2l-1.3 8.2 8.3-11h-6.2l1.3-8Z"/>${connected ? '' : '<path class="connection-slash" d="M4.5 4.5 19.5 19.5"/>'}</svg>`;
   };
-  const CLIENT_BUILD_TAG = 'nexterm-evolution-20-codex-right-click-copy';
+  const CLIENT_BUILD_TAG = 'nexterm-evolution-21-history-scroll-restore';
   const notify = (message, type = 'info') => {
     const toast = document.createElement('div'); toast.textContent = message; toast.style.cssText = `position:fixed;right:18px;bottom:18px;z-index:30;background:${type === 'error' ? '#4d2029' : '#17372f'};border:1px solid ${type === 'error' ? '#9d4656' : '#2b8067'};color:#e8fff7;padding:11px 14px;border-radius:9px;font-size:13px;box-shadow:0 10px 30px #0005`;
     document.body.appendChild(toast); setTimeout(() => toast.remove(), 3000);
@@ -891,10 +892,12 @@
     // avoid sending a transient 0x0/1x1 resize to full-screen programs.
     if (tab?.terminal) requestAnimationFrame(() => requestAnimationFrame(() => {
       if (state.activeTab !== tabId || !tab.view || tab.view.classList.contains('hidden')) return;
-      // Re-assert follow only when the user was actually at the live tail. A
-      // forced pin here would erase the scroll position they left behind, and
-      // a resize can clamp the viewport back to the bottom on its own.
-      fitTerminal(tab); sendResize(tab); tab.terminal.refresh(0, Math.max(0, tab.terminal.rows - 1)); scrollTerminalToBottom(tab); tab.terminal.focus();
+      // A forced pin here would erase the scroll position they left behind,
+      // and a resize can clamp the viewport back to the bottom on its own.
+      // Only re-assert the live tail while the reader is still following it.
+      fitTerminal(tab); sendResize(tab);
+      if (tab.followOutput !== false) { tab.terminal.refresh(0, Math.max(0, tab.terminal.rows - 1)); scrollTerminalToBottom(tab); }
+      tab.terminal.focus();
     }));
   }
   function defaultApprovalModelId() {
@@ -1073,6 +1076,25 @@
     tab.terminal.scrollToBottom?.();
     requestAnimationFrame(() => { if ((force || tab.followOutput !== false) && !terminalUserScrolling(tab)) tab.terminal?.scrollToBottom?.(); });
   }
+  // A live output frame must only pin the viewport to the tail while the
+  // reader is still following it.  Force-fitting the bottom on every frame
+  // cancels a wheel scrollback the moment Codex (or any program) keeps
+  // printing, which is why history above the prompt could not be read until
+  // the session was re-entered.
+  function terminalFollowsLiveTail(tab) {
+    return Boolean(tab?.terminal) && tab.followOutput !== false && !terminalUserScrolling(tab) && terminalAtBottom(tab);
+  }
+  function refreshTerminalTail(tab) {
+    if (!terminalFollowsLiveTail(tab)) return;
+    tab.terminal.scrollToBottom?.();
+    tab.terminal.refresh(0, Math.max(0, tab.terminal.rows - 1));
+  }
+  // A programmatic completion/idle hint may re-assert the live tail, but only
+  // while the reader is still following it; re-pinning here would cancel an
+  // in-flight wheel scrollback for the rest of the repaint.
+  function reassertTerminalLiveTail(tab) {
+    if (tab.id === state.activeTab && tab.followOutput !== false && !terminalUserScrolling(tab)) tab.terminal?.scrollToBottom?.();
+  }
   function terminalViewportText(tab) {
     const terminal = tab?.terminal; const buffer = terminal?.buffer?.active;
     if (!terminal || !buffer) return '';
@@ -1156,7 +1178,7 @@
         // model auto-presses Enter an input prompt also matches this branch, and
         // re-pinning the viewport on every one of those would cancel an in-flight
         // scroll.  xterm already follows the live tail in the normal cases.
-        if (newCompletion || codexReturnedIdle) requestAnimationFrame(() => { if (tab.id === state.activeTab && !terminalUserScrolling(tab) && tab.followOutput !== false) tab.terminal?.scrollToBottom?.(); });
+        if (newCompletion || codexReturnedIdle) requestAnimationFrame(() => { reassertTerminalLiveTail(tab); });
       }
       clearTabAttention(tab);
       return;
@@ -1284,7 +1306,7 @@
     const isCurrentSocket = () => tab.ws === ws && tab.wsGeneration === generation;
     ws.onopen = () => { if (!isCurrentSocket()) return ws.close(); tab.reconnectAttempt = 0; if (tab.id === state.activeTab) fitTerminal(tab); const dimensions = tab.terminal ? { cols: tab.terminal.cols, rows: tab.terminal.rows } : {}; ws.send(JSON.stringify({ type:'connect', serverId:tab.serverId, sessionId:tab.id, lastSeq:tab.lastSeq, initialCwd:tab.initialCwd || '', tabName:tab.name || '', ...dimensions })); };
     // xterm follows the live tail on its own while the reader is not scrolling, so forcing the viewport to the bottom on every output frame would cancel an in-flight upward scroll and hide the newest frame (a finished Codex session, a fresh prompt) until the reader hits F5.  Re-assert it next frame, guarded by the user-scroll flag.
-    ws.onmessage = (event) => { if (!isCurrentSocket()) return; let message; try { message = JSON.parse(event.data); } catch { return; } if (message.type === 'connected') { if (!message.resumed && tab.lastSeq) tab.lastSeq = 0; tab.reconnectBlocked = false; state.takenOverTabs.delete(tab.id); refreshSessionTakeoverDialog(); tab.connected = true; if (!message.resumed) { if (tab.attentionTimer) clearTimeout(tab.attentionTimer); tab.attentionTimer = null; tab.taskWasWorking = false; tab.lastCompletionKey = ''; } tab.reconnectAttempt = 0; renderTabs(); refreshTabCwd(tab); if (tab.approvalEnabled) requestAnimationFrame(() => enableTabApproval(tab, { silent:true })); } else if (message.type === 'snapshot') { restoreTerminalSnapshot(tab, message, isCurrentSocket); } else if (message.type === 'output') { if (message.seq && message.seq <= tab.lastSeq) return; tab.lastSeq = Math.max(tab.lastSeq, Number(message.seq || 0)); const bytes = Uint8Array.from(atob(message.data), (char) => char.charCodeAt(0)); tab.terminal?.write(bytes, () => { if (!isCurrentSocket() || tab.restoring) return; trackTabOutput(tab); requestAnimationFrame(() => { if (!terminalUserScrolling(tab)) tab.terminal?.scrollToBottom?.(); }); }); } else if (message.type === 'cwd') { const pending = tab.cwdRequests?.get(message.requestId); if (!pending) return; clearTimeout(pending.timer); tab.cwdRequests.delete(message.requestId); const directory = String(message.path || ''); if (directory.startsWith('/')) { tab.currentDirectory = directory; persistSessions(); updateTabNames(); } pending.resolve(directory || tab.currentDirectory || tab.initialCwd || ''); } else if (message.type === 'approval') { handleApprovalMessage(tab, message); } else if (message.type === 'error') { tab.connected = false; tab.terminal?.write(`\r\n\x1b[31m${message.message}\x1b[0m\r\n`); notify(message.message, 'error'); renderTabs(); } else if (message.type === 'closed') { tab.connected = false; if (message.reason === 'remote-closed') { closeTab(tab.id); return; } renderTabs(); } };
+    ws.onmessage = (event) => { if (!isCurrentSocket()) return; let message; try { message = JSON.parse(event.data); } catch { return; } if (message.type === 'connected') { if (!message.resumed && tab.lastSeq) tab.lastSeq = 0; tab.reconnectBlocked = false; state.takenOverTabs.delete(tab.id); refreshSessionTakeoverDialog(); tab.connected = true; if (!message.resumed) { if (tab.attentionTimer) clearTimeout(tab.attentionTimer); tab.attentionTimer = null; tab.taskWasWorking = false; tab.lastCompletionKey = ''; } tab.reconnectAttempt = 0; renderTabs(); refreshTabCwd(tab); if (tab.approvalEnabled) requestAnimationFrame(() => enableTabApproval(tab, { silent:true })); } else if (message.type === 'snapshot') { restoreTerminalSnapshot(tab, message, isCurrentSocket); } else if (message.type === 'output') { if (message.seq && message.seq <= tab.lastSeq) return; tab.lastSeq = Math.max(tab.lastSeq, Number(message.seq || 0)); const bytes = Uint8Array.from(atob(message.data), (char) => char.charCodeAt(0)); tab.terminal?.write(bytes, () => { if (!isCurrentSocket() || tab.restoring) return; trackTabOutput(tab); requestAnimationFrame(() => { refreshTerminalTail(tab); }); }); } else if (message.type === 'cwd') { const pending = tab.cwdRequests?.get(message.requestId); if (!pending) return; clearTimeout(pending.timer); tab.cwdRequests.delete(message.requestId); const directory = String(message.path || ''); if (directory.startsWith('/')) { tab.currentDirectory = directory; persistSessions(); updateTabNames(); } pending.resolve(directory || tab.currentDirectory || tab.initialCwd || ''); } else if (message.type === 'approval') { handleApprovalMessage(tab, message); } else if (message.type === 'error') { tab.connected = false; tab.terminal?.write(`\r\n\x1b[31m${message.message}\x1b[0m\r\n`); notify(message.message, 'error'); renderTabs(); } else if (message.type === 'closed') { tab.connected = false; if (message.reason === 'remote-closed') { closeTab(tab.id); return; } renderTabs(); } };
     ws.onclose = (event) => { if (!isCurrentSocket()) return; tab.ws = null; tab.connected = false; tab.restoring = false; if (tab.terminal?.element) tab.terminal.element.style.visibility = ''; resolveCwdRequests(tab, tab.currentDirectory || tab.initialCwd || ''); renderTabs(); if (event.code === 4401) { clearClientSession(); return; } if (event.code === 4000) { tab.reconnectBlocked = true; showSessionTakeoverDialog(tab); return; } if (!tab.manualClose) scheduleReconnect(tab, event.code === 4402); };
     ws.onerror = () => { if (isCurrentSocket() && !tab.manualClose && tab.connected) notify('连接暂时中断，远端会话将保留并自动重连', 'error'); };
   }
