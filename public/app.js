@@ -140,7 +140,7 @@
       if (tab.id === state.activeTab) setTimeout(() => {
         if (!tab.view?.classList.contains('hidden')) {
           scheduleTerminalFit(tab);
-          if (tab.followOutput !== false) { tab.terminal.refresh(0, Math.max(0, tab.terminal.rows - 1)); scrollTerminalToBottom(tab); }
+          tab.terminal.refresh(0, Math.max(0, tab.terminal.rows - 1)); scrollTerminalToBottom(tab, tab.id === state.activeTab);
         }
       }, 0);
     });
@@ -896,7 +896,7 @@
       // and a resize can clamp the viewport back to the bottom on its own.
       // Only re-assert the live tail while the reader is still following it.
       fitTerminal(tab); sendResize(tab);
-      if (tab.followOutput !== false) { tab.terminal.refresh(0, Math.max(0, tab.terminal.rows - 1)); scrollTerminalToBottom(tab); }
+      tab.terminal.refresh(0, Math.max(0, tab.terminal.rows - 1)); scrollTerminalToBottom(tab, tab.id === state.activeTab);
       tab.terminal.focus();
     }));
   }
@@ -1083,10 +1083,13 @@
     tab.terminal.refresh(0, Math.max(0, tab.terminal.rows - 1));
   }
   // A programmatic completion/idle hint may re-assert the live tail, but only
-  // while the reader is still following it; re-pinning here would cancel an
-  // in-flight wheel scrollback for the rest of the repaint.
+  // while the reader is still following it. xterm itself already pins the
+  // viewport on each output frame unless the reader scrolled up, so the only
+  // case that can stick is a full redraw (snapshot restore / terminal reset)
+  // while a new prompt is on its way: force the bottom once on the active
+  // tab, but never over an in-flight wheel scrollback.
   function reassertTerminalLiveTail(tab) {
-    if (tab.id === state.activeTab && tab.followOutput !== false && !terminalUserScrolling(tab)) tab.terminal?.scrollToBottom?.();
+    if (tab.id === state.activeTab && !terminalUserScrolling(tab)) scrollTerminalToBottom(tab, true);
   }
   function terminalViewportText(tab) {
     const terminal = tab?.terminal; const buffer = terminal?.buffer?.active;
