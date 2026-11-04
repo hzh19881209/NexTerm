@@ -1060,11 +1060,13 @@ function sftpPath(input) {
   return value.startsWith('/') ? path.posix.normalize(value) : path.posix.normalize(`/${value}`);
 }
 function uploadRelativePath(input, fallbackName) {
-  const raw = String(input || fallbackName || '').replace(/\\/g, '/').replace(/^\.\//, '');
-  if (!raw || raw.startsWith('/') || raw.includes('\0')) throw new Error('无效的上传路径');
-  const normalized = path.posix.normalize(raw);
-  if (!normalized || normalized === '.' || normalized === '..' || normalized.startsWith('../')) throw new Error('无效的上传路径');
-  return normalized;
+  const raw = String(input || fallbackName || '').replace(/\\/g, '/');
+  const segments = raw.split('/').filter((segment) => segment && segment !== '.');
+  if (!segments.length) throw new Error('无效的上传路径');
+  for (const segment of segments) {
+    if (segment === '..' || segment.includes('\0') || segment === ':' || segment.startsWith(':')) throw new Error('无效的上传路径');
+  }
+  return segments.join('/');
 }
 
 app.get('/api/health', (_req, res) => res.json({ ok: true, name: 'NexTerm', version: APP_VERSION }));

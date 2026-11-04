@@ -1680,7 +1680,7 @@
   function startUploads(tab, files, view, input) {
     if (tab.upload?.active) { notify('已有文件正在上传，请先取消当前上传', 'error'); input.value = ''; return; }
     if (view.uploadHideTimer) { clearTimeout(view.uploadHideTimer); view.uploadHideTimer = null; }
-    const rootPath = $('.path-input', view).value; const entries = files.map((file, index) => { const fallbackRoot = `${String(rootPath || '/').replace(/\/+$/, '') || ''}/upload-${Date.now().toString(36)}`; const relativePath = String(file.webkitRelativePath || '').replace(/\\/g, '/') || `${fallbackRoot}/upload-${index + 1}-${file.name.replace(/[\/:*?"<>|]/g, '_') || 'file'}`; return { file, relativePath }; });
+    const rootPath = sftpPath($('.path-input', view).value); const uploadSession = `upload-${Date.now().toString(36)}`; const isDirectoryPick = input.hasAttribute('data-upload-directory'); const entries = files.map((file, index) => { const baseName = String(file.name || '').replace(/[\/:*?"<>|]/g, '_') || 'file'; const rawRelative = String(file.webkitRelativePath || '').replace(/\\/g, '/'); const segments = rawRelative.split('/').filter((segment) => segment && segment !== '.'); const relativePath = isDirectoryPick && segments.length ? segments.join('/') : `${uploadSession}/upload-${index + 1}-${baseName}`; return { file, relativePath }; });
     const upload = { active: true, currentXhr: null, cancelled: false, index: 0, totalBytes: entries.reduce((sum, entry) => sum + entry.file.size, 0), sentBytes: 0 }; tab.upload = upload;
     const cancelButton = $('[data-upload-cancel]', view); if (cancelButton) cancelButton.onclick = () => { if (tab.upload !== upload) return; upload.cancelled = true; cancelButton.disabled = true; upload.currentXhr?.abort(); };
     const sendNext = () => {
