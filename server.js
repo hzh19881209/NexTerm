@@ -344,14 +344,32 @@ function approvalModels(user) {
   const items = Array.isArray(user?.approvalModels) ? user.approvalModels : [];
   return items.filter((item) => item && typeof item === 'object' && item.id);
 }
+// The model ID field is a plain display label that is echoed to the browser in
+// the auto-approval status/history. Users sometimes paste their upstream API key
+// into it by mistake; mask anything that looks like a credential so it is never
+// rendered in the UI. The real key still travels only inside the encrypted
+// apiKey field.
+const APPROVAL_SECRET_PATTERNS = [
+  /Bearer\s+[A-Za-z0-9\-_.~+\/]+={0,2}/gi,
+  /\b(?:sk|pk|gsk|tm|key|token)_[A-Za-z0-9]{8,}\b/gi,
+  /\b[A-Za-z0-9]{16,}(?:[+\/][A-Za-z0-9]+)*(?:={0,2})\b/g,
+  /[+\/]{2,}[A-Za-z0-9+/=]{16,}/g,
+  /(?<=[?:=])\s*['\"]?[A-Za-z0-9+/=_\-]{20,}['\"]?/g,
+  /[A-Za-z0-9+/=_\-]{16,}(:[A-Za-z0-9+/=_\-]+){2,}/g
+];
+function approvalMaskSecrets(value) {
+  let masked = String(value || '');
+  for (const pattern of APPROVAL_SECRET_PATTERNS) { pattern.lastIndex = 0; masked = masked.replace(pattern, '••••（已隐藏）'); }
+  return masked;
+}
 function publicApprovalModel(model) {
   const keyCiphertext = model.apiKey || '';
   const plaintext = keyCiphertext ? decrypt(keyCiphertext) : '';
   return {
     id: model.id,
-    name: String(model.name || ''),
+    name: approvalMaskSecrets(model.name),
     baseUrl: String(model.baseUrl || ''),
-    model: String(model.model || ''),
+    model: approvalMaskSecrets(model.model),
     hasKey: Boolean(plaintext),
     keyHint: plaintext ? `••••${plaintext.slice(-4)}` : '',
     enabled: model.enabled !== false,
@@ -1136,7 +1154,7 @@ app.post('/api/approval-models', auth, csrf, passwordChanged, (req, res) => {
     if (list.length >= APPROVAL_MODELS_MAX) throw new Error(`最多保存 ${APPROVAL_MODELS_MAX} 个审批模型`);
     const model = cleanApprovalModelInput(req.body);
     req.account.approvalModels = [...list, model]; writeJson(usersFile, users);
-    auditEvent('approval_model.created', req, req.account, '已添加审批模型', { modelId:model.id, modelName:model.name, baseUrl:model.baseUrl, model:model.model });
+    auditEvent('approval_model.created', req, req.account, '已添加审批模型', { modelId:model.id, modelName:approvalMaskSecrets(model.name), baseUrl:model.baseUrl, model:approvalMaskSecrets(model.model) });
     res.status(201).json({ model: publicApprovalModel(model), models: approvalModels(req.account).map(publicApprovalModel) });
   } catch (error) { res.status(400).json({ error: error.message || '审批模型保存失败' }); }
 });
@@ -1156,7 +1174,7 @@ app.put('/api/approval-models/:id', auth, csrf, passwordChanged, (req, res) => {
   try {
     const model = cleanApprovalModelInput(req.body, list[index]);
     req.account.approvalModels = [...list.slice(0, index), model, ...list.slice(index + 1)]; writeJson(usersFile, users);
-    auditEvent('approval_model.updated', req, req.account, '已更新审批模型', { modelId:model.id, modelName:model.name, baseUrl:model.baseUrl, model:model.model });
+    auditEvent('approval_model.updated', req, req.account, '已更新审批模型', { modelId:model.id, modelName:approvalMaskSecrets(model.name), baseUrl:model.baseUrl, model:approvalMaskSecrets(model.model) });
     res.json({ model: publicApprovalModel(model), models: approvalModels(req.account).map(publicApprovalModel) });
   } catch (error) { res.status(400).json({ error: error.message || '审批模型保存失败' }); }
 });
@@ -1743,7 +1761,7 @@ async function evaluateSessionApproval(session) {
   session.approvalResolving = true;
   const promptKey = crypto.createHash('sha256').update(screen).digest('hex').slice(0, 16);
   session.approvalPending = { key: promptKey, screen };
-  approvalSend(session, { action:'evaluating', promptKey, modelName:model.name, model:model.model });
+  approvalSend(session, { action:'evaluating', promptKey, modelName:approvalMaskSecrets(model.name), model:approvalMaskSecrets(model.model) });
   const server = findServer(session.serverId);
   const notes = [];
   if (session.approval.rememberAll) notes.push('用户已开启“同类操作不再询问”，若确属重复的低风险操作可用 approve_always。');
@@ -1835,7 +1853,7 @@ function startSessionApproval(session, modelId) {
   if (session.approvalTimer) clearTimeout(session.approvalTimer);
   session.approvalFrames = 0; session.approvalLastScreen = ''; session.approvalPending = null; session.approvalResolving = false;
   auditEvent('approval.enabled', null, account, '已开启终端自动审批', { sessionId:session.id, serverId:session.serverId, modelId:model.id, modelName:model.name });
-  approvalSend(session, { action:'state', enabled:true, modelId:model.id, modelName:model.name, model:model.model });
+  approvalSend(session, { action:'state', enabled:true, modelId:model.id, modelName:approvalMaskSecrets(model.name), model:approvalMaskSecrets(model.model) });
   scheduleApprovalScan(session, 300);
   return { model: publicApprovalModel(model) };
 }
@@ -2200,7 +2218,7 @@ wss.on('connection', (ws, authContext) => {
         } else if (action === 'status') {
           const enabled = Boolean(session.approval?.enabled);
           const model = findApprovalModel(users.find((item) => item.id === ownerId) || {}, String(session.approval?.modelId || '')) || null;
-          send({ type:'approval', action:'state', enabled, modelId: session.approval?.modelId || '', modelName: model?.name || '', model: model?.model || '', rememberAll: Boolean(session.approval?.rememberAll), stopReason: session.approvalStopReason || '' });
+          send({ type:'approval', action:'state', enabled, modelId: session.approval?.modelId || '', modelName: model ? approvalMaskSecrets(model.name) : '', model: model ? approvalMaskSecrets(model.model) : '', rememberAll: Boolean(session.approval?.rememberAll), stopReason: session.approvalStopReason || '' });
         } else {
           send({ type:'approval', action:'error', reason:'unsupported', message:'不支持的审批操作' });
         }

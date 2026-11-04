@@ -1989,9 +1989,11 @@
     const value = String(text || '');
     if (!value) return value;
     let masked = value.replace(/\bBearer\s+[A-Za-z0-9\-_.~+\/]+={0,2}/gi, 'Bearer ••••（已隐藏）');
-    masked = masked.replace(/\b(?:sk|pk|gsk)_[A-Za-z0-9]{8,}/g, '••••（已隐藏）');
-    masked = masked.replace(/\b[A-Za-z0-9]{16,}/g, '••••（已隐藏）');
+    masked = masked.replace(/\b(?:sk|pk|gsk|tm|key|token)_[A-Za-z0-9]{8,}/g, '••••（已隐藏）');
+    masked = masked.replace(/\b[A-Za-z0-9]{16,}(?:[+/][A-Za-z0-9]+)*(?:={0,2})\b/g, '••••（已隐藏）');
+    masked = masked.replace(/[+\/]{2,}[A-Za-z0-9+/=]{16,}/g, '••••（已隐藏）');
     masked = masked.replace(/(?<=[?:=])\s*['"]?[A-Za-z0-9+/=_\-]{20,}['"]?/g, '••••（已隐藏）');
+    masked = masked.replace(/[A-Za-z0-9+/=_\-]{16,}(:[A-Za-z0-9+/=_\-]+){2,}/g, '••••（已隐藏）');
     return masked;
   };
   function openApprovalHistoryModal() {
