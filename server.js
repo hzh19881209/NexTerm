@@ -1608,10 +1608,16 @@ function rememberOutput(session, data) {
       session.approvalHumanGoneFrames = (session.approvalHumanGoneFrames || 0) + 1;
       if (session.approvalHumanGoneFrames >= 3) {
         const account = users.find((item) => item.id === session.ownerId);
-        resolveHighRiskEntry(account, session.approvalHighRiskPrompt.promptKey, '', '提示已消失', '用户未在终端选择，提示已消失');
-        auditEvent('approval.high_risk_unresolved', null, account || null, '提示已消失：用户未选择', { sessionId:session.id, promptKey:session.approvalHighRiskPrompt.promptKey });
-        approvalSend(session, { action:'resolved', promptKey:session.approvalHighRiskPrompt.promptKey, reason:'prompt-gone' });
+        const userTyped = String(session.highRiskInput || '').trim();
+        const hadUserInput = userTyped.length > 0;
+        const resolvedChoice = hadUserInput ? 'other' : '';
+        const resolvedLabel = hadUserInput ? `按键 ${userTyped.replace(/\x1b\[[A-Za-z]/g, '↑↓←→').replace(/\s+/g, ' ').trim()}` : '提示已消失';
+        const resolvedReason = hadUserInput ? '用户在终端中操作后提示消失' : '用户未在终端选择，提示已消失';
+        resolveHighRiskEntry(account, session.approvalHighRiskPrompt.promptKey, resolvedChoice, resolvedLabel, resolvedReason);
+        auditEvent(hadUserInput ? 'approval.high_risk_resolved' : 'approval.high_risk_unresolved', null, account || null, hadUserInput ? `高危提示人工处理：${resolvedLabel}` : '提示已消失：用户未选择', { sessionId:session.id, promptKey:session.approvalHighRiskPrompt.promptKey, choice: resolvedChoice });
+        approvalSend(session, { action: hadUserInput ? 'high_risk_resolved' : 'resolved', promptKey:session.approvalHighRiskPrompt.promptKey, choice: resolvedChoice, label: resolvedLabel, reason: hadUserInput ? '' : 'prompt-gone' });
         session.approvalHighRiskPrompt = null;
+        session.highRiskInput = '';
         session.approvalHumanGoneFrames = 0;
       }
     } else {
@@ -2199,12 +2205,22 @@ wss.on('connection', (ws, authContext) => {
           try { text = Buffer.from(message.data, 'base64').toString('utf8'); } catch { text = ''; }
           for (const char of text) {
             if (char === '\r') {
-              const buffer = (watched.highRiskInput || '').toLowerCase().replace(/\s+/g, ' ').trim();
+              const rawBuffer = watched.highRiskInput || '';
+              const buffer = rawBuffer.toLowerCase().replace(/\s+/g, ' ').trim();
               watched.highRiskInput = '';
               if (!buffer) continue;
-              const choice = buffer === '1' ? 'approve_once' : buffer === '2' ? 'approve_always' : buffer === '3' ? 'deny' : (/^(y|yes|p|esc|q|n|no|u|unknown)$/i.test(buffer) ? 'other' : '');
-              if (!choice) continue;
-              const label = choice === 'approve_once' ? '1 Yes, proceed' : choice === 'approve_always' ? '2 Yes, and don\'t ask again' : choice === 'deny' ? '3 No, tell it what to do differently' : `按键 ${buffer.charAt(0).toUpperCase()}`;
+              // Detect arrow-key TUI navigation (ESC [ A/B/C/D) as a menu selection
+              const arrowMatch = rawBuffer.match(/\x1b\[([ABCD])/);
+              let choice, label;
+              if (arrowMatch) {
+                const dir = { A:'↑', B:'↓', C:'→', D:'←' }[arrowMatch[1]] || arrowMatch[1];
+                choice = 'other';
+                label = `方向键 ${dir} + 确认`;
+              } else {
+                choice = buffer === '1' ? 'approve_once' : buffer === '2' ? 'approve_always' : buffer === '3' ? 'deny' : (/^(y|yes|p|esc|q|n|no|u|unknown)$/i.test(buffer) ? 'other' : '');
+                if (!choice) continue;
+                label = choice === 'approve_once' ? '1 Yes, proceed' : choice === 'approve_always' ? "2 Yes, and don't ask again" : choice === 'deny' ? '3 No, tell it what to do differently' : `按键 ${buffer.charAt(0).toUpperCase()}`;
+              }
               const account = users.find((item) => item.id === watched.ownerId);
               resolveHighRiskEntry(account, watched.approvalHighRiskPrompt.promptKey, choice, label, '用户在终端中手动按键');
               auditEvent('approval.high_risk_resolved', null, account || null, `高危提示人工处理：${label}`, { sessionId:watched.id, promptKey:watched.approvalHighRiskPrompt.promptKey, choice });
@@ -2212,7 +2228,7 @@ wss.on('connection', (ws, authContext) => {
               watched.approvalHighRiskPrompt = null;
               continue;
             }
-            if (/^[\x00-\x1f]$/.test(char)) continue;
+            if (/^[\x00-\x1f]$/.test(char) && char !== '\x1b') continue;
             watched.highRiskInput = `${(watched.highRiskInput || '').slice(-15)}${char}`;
             if (!/[1-9a-zA-Z]/.test(char) && watched.highRiskInput.length > 32) watched.highRiskInput = '';
           }
