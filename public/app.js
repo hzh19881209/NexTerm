@@ -1915,7 +1915,7 @@
       };
       const renderEditor = (model = null) => {
         editor.dataset.editing = model?.id || '';
-        editor.innerHTML = `<form class="approval-form" data-approval-form><h4>${model ? '编辑模型' : '添加模型'}</h4><div class="field"><label>名称</label><input name="name" maxlength="64" required value="${escapeHtml(model?.name || '')}" placeholder="例如：本机 LM Studio" /></div><div class="field"><label>Base URL</label><input name="baseUrl" required value="${escapeHtml(model?.baseUrl || '')}" placeholder="http://127.0.0.1:1234/v1" /><small>通常以 /v1 结尾；TokenMeter 用 https://HOST:9080/v1</small></div><div class="field"><label>模型 ID</label><input name="model" maxlength="256" required value="${escapeHtml(model?.model || '')}" placeholder="例如：qwen2.5-coder-7b" /></div><div class="field"><label>API Key${model?.hasKey ? '（留空保持不变）' : '（本地服务可留空）'}</label><input name="apiKey" type="password" autocomplete="off" value="" placeholder="${model?.hasKey ? model.keyHint : 'sk-...'}" /></div><label class="approval-enabled"><input name="enabled" type="checkbox" ${model?.enabled === false ? '' : 'checked'} /><span>启用此模型</span></label><div class="approval-presets"><span>快速填充：</span>${APPROVAL_PRESETS.map((preset, index) => `<button type="button" class="secondary" data-preset="${index}">${escapeHtml(preset.label)}</button>`).join('')}</div><div class="error" data-editor-error></div><div class="modal-actions inline"><button type="button" class="secondary" data-editor-cancel>取消</button><button type="submit" class="primary">${model ? '保存修改' : '保存模型'}</button></div></form>`;
+        editor.innerHTML = `<form class="approval-form" data-approval-form><h4>${model ? '编辑模型' : '添加模型'}</h4><div class="field"><label>名称</label><input name="name" maxlength="64" required value="${escapeHtml(cleanApprovalField(model?.name))}" placeholder="例如：本机 LM Studio" /></div><div class="field"><label>Base URL</label><input name="baseUrl" required value="${escapeHtml(cleanApprovalField(model?.baseUrl))}" placeholder="http://127.0.0.1:1234/v1" /><small>通常以 /v1 结尾；TokenMeter 用 https://HOST:9080/v1</small></div><div class="field"><label>模型 ID</label><input name="model" maxlength="256" required value="${escapeHtml(cleanApprovalField(model?.model))}" placeholder="例如：qwen2.5-coder-7b" /></div><div class="field"><label>API Key${model?.hasKey ? '（留空保持不变）' : '（本地服务可留空）'}</label><input name="apiKey" type="password" autocomplete="off" value="" placeholder="${model?.hasKey ? model.keyHint : 'sk-...'}" /></div><label class="approval-enabled"><input name="enabled" type="checkbox" ${model?.enabled === false ? '' : 'checked'} /><span>启用此模型</span></label><div class="approval-presets"><span>快速填充：</span>${APPROVAL_PRESETS.map((preset, index) => `<button type="button" class="secondary" data-preset="${index}">${escapeHtml(preset.label)}</button>`).join('')}</div><div class="error" data-editor-error></div><div class="modal-actions inline"><button type="button" class="secondary" data-editor-cancel>取消</button><button type="submit" class="primary">${model ? '保存修改' : '保存模型'}</button></div></form>`;
         editor.scrollIntoView({ block:'end', behavior:'smooth' });
         const form = $('[data-approval-form]', editor);
         backdrop.querySelectorAll('[data-preset]').forEach((button) => button.onclick = () => {
@@ -1985,17 +1985,28 @@
   // Upstream API keys can appear in the captured prompt block when a model is
   // configured with credentials embedded in its Base URL. Never echo them back
   // to the browser in the approval history.
+  const APPROVAL_SECRET_MASK_RE = [
+    /\bBearer\s+[A-Za-z0-9\-_.~+\/]+={0,2}/gi,
+    /\b(?:sk|pk|gsk|tm|key|token)_[A-Za-z0-9]{8,}/g,
+    /\b[A-Za-z0-9]{16,}(?:[+/][A-Za-z0-9]+)*(?:={0,2})\b/g,
+    /[+\/]{2,}[A-Za-z0-9+/=]{16,}/g,
+    /(?<=[?:=])\s*['"]?[A-Za-z0-9+/=_\-]{20,}['"]?/g,
+    /[A-Za-z0-9+/=_\-]{16,}(:[A-Za-z0-9+/=_\-]+){2,}/g,
+    /Bearer%20[A-Za-z0-9%\-_.~+]{8,}/gi,
+    /\b(?:sk|pk|gsk|tm|key|token)%5F[A-Za-z0-9]{8,}/gi,
+    /\b[A-Za-z0-9]{16,}(?:%2F[0-9A-Za-z]+)*\b/g,
+    /%2F{2,}[0-9A-Za-z%]{16,}/g
+  ];
   const maskApprovalSecrets = (text) => {
     const value = String(text || '');
     if (!value) return value;
-    let masked = value.replace(/\bBearer\s+[A-Za-z0-9\-_.~+\/]+={0,2}/gi, 'Bearer ••••（已隐藏）');
-    masked = masked.replace(/\b(?:sk|pk|gsk|tm|key|token)_[A-Za-z0-9]{8,}/g, '••••（已隐藏）');
-    masked = masked.replace(/\b[A-Za-z0-9]{16,}(?:[+/][A-Za-z0-9]+)*(?:={0,2})\b/g, '••••（已隐藏）');
-    masked = masked.replace(/[+\/]{2,}[A-Za-z0-9+/=]{16,}/g, '••••（已隐藏）');
-    masked = masked.replace(/(?<=[?:=])\s*['"]?[A-Za-z0-9+/=_\-]{20,}['"]?/g, '••••（已隐藏）');
-    masked = masked.replace(/[A-Za-z0-9+/=_\-]{16,}(:[A-Za-z0-9+/=_\-]+){2,}/g, '••••（已隐藏）');
+    let masked = value;
+    for (const pattern of APPROVAL_SECRET_MASK_RE) { pattern.lastIndex = 0; masked = masked.replace(pattern, '••••（已隐藏）'); }
     return masked;
   };
+  // Values can arrive percent-encoded (legacy data or a paste from an address
+  // bar). Decode for display/editing only; the save path re-validates.
+  const cleanApprovalField = (value) => { try { return decodeURIComponent(String(value || '')); } catch { return String(value || ''); } };
   function openApprovalHistoryModal() {
     const backdrop = document.createElement('div');
     backdrop.className = 'modal-backdrop';

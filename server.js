@@ -320,12 +320,19 @@ function userPreferences(value, account = null) {
   const approvalDefaultModelId = requested && known.includes(requested) ? requested : '';
   return { fontFamily: UI_FONT_FAMILIES.has(preferences.fontFamily) ? preferences.fontFamily : 'system', terminalFontSize: Math.max(11, Math.min(24, Number(preferences.terminalFontSize) || 13)), approvalDefaultModelId };
 }
+// A pasted value can carry percent-encoding (e.g. copied from an address bar or
+// a query string: "https%3A//host/v1"). Decode once so we store a clean URL and
+// never surface a percent-encoded duplicate in the UI or logs.
+function normalizeApprovalText(value) {
+  const text = String(value || '');
+  try { return decodeURIComponent(text); } catch { return text; }
+}
 // --- AI approval assistant: stored models ------------------------------------
 // Each account owns a small list of OpenAI-compatible chat models. The upstream
 // API key is stored encrypted with the app key and is never returned to the
 // browser; only a masked hint is exposed.
 function approvalBaseUrl(value) {
-  const raw = String(value || '').trim();
+  const raw = normalizeApprovalText(value).trim();
   if (!raw) throw new Error('Base URL 不能为空');
   if (raw.length > 512) throw new Error('Base URL 过长');
   let url;
@@ -357,9 +364,20 @@ const APPROVAL_SECRET_PATTERNS = [
   /(?<=[?:=])\s*['\"]?[A-Za-z0-9+/=_\-]{20,}['\"]?/g,
   /[A-Za-z0-9+/=_\-]{16,}(:[A-Za-z0-9+/=_\-]+){2,}/g
 ];
+// Same shapes as above, but for percent-encoded variants of a secret (e.g.
+// "tm%5F..." or "sk%2D..."). Only applied on display-time masking; never stored.
+const APPROVAL_SECRET_PATTERNS_ENCODED = [
+  /Bearer%20[A-Za-z0-9%\-_.~+]{8,}/gi,
+  /\b(?:sk|pk|gsk|tm|key|token)%5F[A-Za-z0-9]{8,}\b/gi,
+  /\b[A-Za-z0-9]{16,}(?:%2F[0-9A-Za-z]+)*\b/g,
+  /%2F{2,}[0-9A-Za-z%]{16,}/g,
+  /(?<=[?:=])\s*['\"%5E]?(?:[0-9A-Fa-f]{2}|[A-Za-z0-9+_\-]){20,}/g,
+  /(?:[0-9A-Fa-f]{2}|[A-Za-z0-9+_\-]){16,}(%3A(?:[0-9A-Fa-f]{2}|[A-Za-z0-9+_\-]+)){2,}/g
+];
 function approvalMaskSecrets(value) {
   let masked = String(value || '');
   for (const pattern of APPROVAL_SECRET_PATTERNS) { pattern.lastIndex = 0; masked = masked.replace(pattern, '••••（已隐藏）'); }
+  for (const pattern of APPROVAL_SECRET_PATTERNS_ENCODED) { pattern.lastIndex = 0; masked = masked.replace(pattern, '••••（已隐藏）'); }
   return masked;
 }
 function publicApprovalModel(model) {
@@ -378,8 +396,8 @@ function publicApprovalModel(model) {
   };
 }
 function cleanApprovalModelInput(body, old = {}) {
-  const name = String(body.name ?? old.name ?? '').trim().slice(0, APPROVAL_NAME_MAX);
-  const model = String(body.model ?? old.model ?? '').trim().slice(0, APPROVAL_MODEL_MAX);
+  const name = normalizeApprovalText(body.name ?? old.name ?? '').trim().slice(0, APPROVAL_NAME_MAX);
+  const model = normalizeApprovalText(body.model ?? old.model ?? '').trim().slice(0, APPROVAL_MODEL_MAX);
   if (!name) throw new Error('模型名称不能为空');
   if (!model) throw new Error('模型 ID 不能为空');
   const baseUrl = approvalBaseUrl(body.baseUrl ?? old.baseUrl);
