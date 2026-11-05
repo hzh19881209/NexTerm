@@ -1272,7 +1272,54 @@
     refreshSessionTakeoverDialog();
   }
   function scheduleReconnect(tab, immediate = false) { if (tab.manualClose || tab.reconnectTimer || !state.tabs.has(tab.id)) return; const delay = immediate ? 0 : Math.min(15000, 1000 * (2 ** Math.min(tab.reconnectAttempt++, 4))); tab.reconnectTimer = setTimeout(() => { tab.reconnectTimer = null; connectTab(tab); }, delay); }
-  function closeTab(tabId) { const tab = state.tabs.get(tabId); if (!tab) return; tab.manualClose = true; if (tab.kind === 'vnc') disposeVnc(tab); tab.upload?.currentXhr?.abort(); if (tab.reconnectTimer) clearTimeout(tab.reconnectTimer); if (tab.attentionTimer) clearTimeout(tab.attentionTimer); if (tab.approvalStatusTimer) clearTimeout(tab.approvalStatusTimer); resolveCwdRequests(tab); tab.reconnectTimer = null; tab.attentionTimer = null; tab.approvalStatusTimer = null; if (tab.ws && tab.ws.readyState <= WebSocket.OPEN) { tab.ws.send(JSON.stringify({ type:'close' })); tab.ws.close(); } tab.view?.remove(); state.tabs.delete(tabId); state.takenOverTabs.delete(tabId); refreshSessionTakeoverDialog(); const next = state.tabs.keys().next().value; state.activeTab = next || null; persistSessions(); renderTabs(); if (next) activateTab(next); else $('#content').innerHTML = '<div class="welcome"><div class="welcome-card"><h2>选择服务器开始</h2><p>你的会话会显示在这里。</p></div></div>'; renderServers(); }
+  // Codex CLI prints "Goodbye!" when the user types /exit (or the shell ends with
+// exit/EOF). Watch for it so we can clear this tab's approval history and drop
+// the reconnect loop.
+const CODEX_GOODBYE_PATTERN = /Goodbye!\s*$/i;
+let terminalExitDetectedAt = new Map(); // tabId -> timestamp
+function detectTerminalExit(tab) {
+  if (tab.kind !== 'ssh') return;
+  const terminal = tab?.terminal;
+  if (!terminal) return;
+  try {
+    const buffer = terminal.buffer?.active;
+    if (!buffer) return;
+    const end = buffer.length;
+    const start = Math.max(0, end - 8);
+    let tail = '';
+    for (let i = start; i < end; i += 1) {
+      const line = buffer.getLine(i);
+      if (!line) continue;
+      tail += line.translateToString(true) + '\n';
+    }
+    if (!CODEX_GOODBYE_PATTERN.test(tail)) return;
+    const last = terminalExitDetectedAt.get(tab.id) || 0;
+    if (Date.now() - last < 10_000) return;
+    terminalExitDetectedAt.set(tab.id, Date.now());
+    // Only clear when the user initiated the exit; a server-side crash or
+    // network drop will show a reconnect banner and the user can retry.
+    if (tab.connected) void clearTabApprovalHistory(tab).then(() => {
+      closeTab(tab.id);
+    });
+  } catch { /* buffer access is best-effort */ }
+}
+// Empties this tab's approval history on the server side and locally.
+// Called when the tab is closed manually or its shell exits.
+async function clearTabApprovalHistory(tab) {
+  if (tab?.kind !== 'ssh') return;
+  // Stop the auto-approval loop so the server does not keep evaluating prompts.
+  if (tab.ws && tab.ws.readyState === WebSocket.OPEN && tab.approvalEnabled) {
+    try { tab.ws.send(JSON.stringify({ type: 'approval', action: 'disable' })); } catch { /* socket may be closing */ }
+  }
+  tab.approvalEnabled = false; tab.approvalStatus = ''; tab.approvalTone = 'info';
+  tab.approvalStopReason = ''; tab.approvalStopReasonMessage = ''; tab.approvalNotice = '';
+  try {
+    await api('/api/approval-history/clear', { method: 'POST', body: JSON.stringify({ sessionId: tab.id, sessionName: tab.name || '' }) });
+  } catch (e) {
+    // Best-effort; the tab may already be gone.
+  }
+}
+function closeTab(tabId) { const tab = state.tabs.get(tabId); if (!tab) return; tab.manualClose = true; if (tab.kind === 'vnc') disposeVnc(tab); else void clearTabApprovalHistory(tab); tab.upload?.currentXhr?.abort(); if (tab.reconnectTimer) clearTimeout(tab.reconnectTimer); if (tab.attentionTimer) clearTimeout(tab.attentionTimer); if (tab.approvalStatusTimer) clearTimeout(tab.approvalStatusTimer); resolveCwdRequests(tab); tab.reconnectTimer = null; tab.attentionTimer = null; tab.approvalStatusTimer = null; if (tab.ws && tab.ws.readyState <= WebSocket.OPEN) { tab.ws.send(JSON.stringify({ type:'close' })); tab.ws.close(); } tab.view?.remove(); state.tabs.delete(tabId); state.takenOverTabs.delete(tabId); refreshSessionTakeoverDialog(); const next = state.tabs.keys().next().value; state.activeTab = next || null; persistSessions(); renderTabs(); if (next) activateTab(next); else $('#content').innerHTML = '<div class="welcome"><div class="welcome-card"><h2>选择服务器开始</h2><p>你的会话会显示在这里。</p></div></div>'; renderServers(); }
   function restoreTerminalSnapshot(tab, message, isCurrentSocket) {
     const terminal = tab.terminal; if (!terminal) return;
     const generation = tab.restoreGeneration = (tab.restoreGeneration || 0) + 1;
@@ -1300,9 +1347,9 @@
     watchTerminalSelection(tab);
     const protocol = location.protocol === 'https:' ? 'wss' : 'ws'; const ws = new WebSocket(`${protocol}://${location.host}/ws`); const generation = ++tab.wsGeneration; tab.ws = ws;
     const isCurrentSocket = () => tab.ws === ws && tab.wsGeneration === generation;
-    ws.onopen = () => { if (!isCurrentSocket()) return ws.close(); tab.reconnectAttempt = 0; if (tab.id === state.activeTab) fitTerminal(tab); const dimensions = tab.terminal ? { cols: tab.terminal.cols, rows: tab.terminal.rows } : {}; ws.send(JSON.stringify({ type:'connect', serverId:tab.serverId, sessionId:tab.id, lastSeq:tab.lastSeq, initialCwd:tab.initialCwd || '', tabName:tab.name || '', ...dimensions })); };
+    ws.onopen = () => { if (!isCurrentSocket()) return ws.close(); tab.reconnectAttempt = 0; if (tab.id === state.activeTab) fitTerminal(tab); const dimensions = tab.terminal ? { cols: tab.terminal.cols, rows: tab.terminal.rows } : {}; ws.send(JSON.stringify({ type:'connect', serverId:tab.serverId, sessionId:tab.id, lastSeq:tab.lastSeq, initialCwd:tab.initialCwd || '', tabName:tab.name || '', tabId:tab.id, ...dimensions })); };
     // xterm follows the live tail on its own while the reader is not scrolling, so forcing the viewport to the bottom on every output frame would cancel an in-flight upward scroll and hide the newest frame (a finished Codex session, a fresh prompt) until the reader hits F5.  Re-assert it next frame, guarded by the user-scroll flag.
-    ws.onmessage = (event) => { if (!isCurrentSocket()) return; let message; try { message = JSON.parse(event.data); } catch { return; } if (message.type === 'connected') { if (!message.resumed && tab.lastSeq) tab.lastSeq = 0; tab.reconnectBlocked = false; state.takenOverTabs.delete(tab.id); refreshSessionTakeoverDialog(); tab.connected = true; if (!message.resumed) { if (tab.attentionTimer) clearTimeout(tab.attentionTimer); tab.attentionTimer = null; tab.taskWasWorking = false; tab.lastCompletionKey = ''; } tab.reconnectAttempt = 0; renderTabs(); refreshTabCwd(tab); if (tab.approvalEnabled) requestAnimationFrame(() => enableTabApproval(tab, { silent:true })); } else if (message.type === 'snapshot') { restoreTerminalSnapshot(tab, message, isCurrentSocket); } else if (message.type === 'output') { if (message.seq && message.seq <= tab.lastSeq) return; tab.lastSeq = Math.max(tab.lastSeq, Number(message.seq || 0)); const bytes = Uint8Array.from(atob(message.data), (char) => char.charCodeAt(0)); tab.terminal?.write(bytes, () => { if (!isCurrentSocket() || tab.restoring) return; trackTabOutput(tab); requestAnimationFrame(() => { refreshTerminalTail(tab); }); }); } else if (message.type === 'cwd') { const pending = tab.cwdRequests?.get(message.requestId); if (!pending) return; clearTimeout(pending.timer); tab.cwdRequests.delete(message.requestId); const directory = String(message.path || ''); if (directory.startsWith('/')) { tab.currentDirectory = directory; persistSessions(); updateTabNames(); } pending.resolve(directory || tab.currentDirectory || tab.initialCwd || ''); } else if (message.type === 'approval') { handleApprovalMessage(tab, message); } else if (message.type === 'error') { tab.connected = false; tab.terminal?.write(`\r\n\x1b[31m${message.message}\x1b[0m\r\n`); notify(message.message, 'error'); renderTabs(); } else if (message.type === 'closed') { tab.connected = false; if (message.reason === 'remote-closed') { closeTab(tab.id); return; } renderTabs(); } };
+    ws.onmessage = (event) => { if (!isCurrentSocket()) return; let message; try { message = JSON.parse(event.data); } catch { return; } if (message.type === 'connected') { if (!message.resumed && tab.lastSeq) tab.lastSeq = 0; tab.reconnectBlocked = false; state.takenOverTabs.delete(tab.id); refreshSessionTakeoverDialog(); tab.connected = true; if (!message.resumed) { if (tab.attentionTimer) clearTimeout(tab.attentionTimer); tab.attentionTimer = null; tab.taskWasWorking = false; tab.lastCompletionKey = ''; } tab.reconnectAttempt = 0; renderTabs(); refreshTabCwd(tab); if (tab.approvalEnabled) requestAnimationFrame(() => enableTabApproval(tab, { silent:true })); } else if (message.type === 'snapshot') { restoreTerminalSnapshot(tab, message, isCurrentSocket); } else if (message.type === 'output') { if (message.seq && message.seq <= tab.lastSeq) return; tab.lastSeq = Math.max(tab.lastSeq, Number(message.seq || 0)); const bytes = Uint8Array.from(atob(message.data), (char) => char.charCodeAt(0)); tab.terminal?.write(bytes, () => { if (!isCurrentSocket() || tab.restoring) return; trackTabOutput(tab); detectTerminalExit(tab); requestAnimationFrame(() => { refreshTerminalTail(tab); }); }); } else if (message.type === 'cwd') { const pending = tab.cwdRequests?.get(message.requestId); if (!pending) return; clearTimeout(pending.timer); tab.cwdRequests.delete(message.requestId); const directory = String(message.path || ''); if (directory.startsWith('/')) { tab.currentDirectory = directory; persistSessions(); updateTabNames(); } pending.resolve(directory || tab.currentDirectory || tab.initialCwd || ''); } else if (message.type === 'approval') { handleApprovalMessage(tab, message); } else if (message.type === 'error') { tab.connected = false; tab.terminal?.write(`\r\n\x1b[31m${message.message}\x1b[0m\r\n`); notify(message.message, 'error'); renderTabs(); } else if (message.type === 'closed') { tab.connected = false; if (message.reason === 'remote-closed') { closeTab(tab.id); return; } renderTabs(); } };
     ws.onclose = (event) => { if (!isCurrentSocket()) return; tab.ws = null; tab.connected = false; tab.restoring = false; if (tab.terminal?.element) tab.terminal.element.style.visibility = ''; resolveCwdRequests(tab, tab.currentDirectory || tab.initialCwd || ''); renderTabs(); if (event.code === 4401) { clearClientSession(); return; } if (event.code === 4000) { tab.reconnectBlocked = true; showSessionTakeoverDialog(tab); return; } if (!tab.manualClose) scheduleReconnect(tab, event.code === 4402); };
     ws.onerror = () => { if (isCurrentSocket() && !tab.manualClose && tab.connected) notify('连接暂时中断，远端会话将保留并自动重连', 'error'); };
   }
@@ -1772,22 +1819,52 @@
   const evolutionStatusIcon = (status) => status === 'verified' ? '<span class="evolution-mark verified" title="已确认闭环">✔</span>' : status === 'fixed' ? '<span class="evolution-mark fixed" title="AI 已修复，待你确认">✓</span>' : status === 'rejected' ? '<span class="evolution-mark rejected" title="未修复或不接受">✕</span>' : '<span class="evolution-mark pending" title="待处理">•</span>';
   function openEvolutionModal() {
     const backdrop = document.createElement('div'); backdrop.className = 'modal-backdrop';
-    backdrop.innerHTML = `<div class="modal evolution-modal"><div class="modal-head"><h3>进化</h3><button type="button" class="icon-btn" data-close aria-label="关闭">×</button></div><div class="modal-body"><p class="evolution-hint">每一行提交一条改进建议或一个 bug 描述，提交后保存在服务器数据库中；AI IDE 会在下次开发时读取并针对性优化。AI 标记「已修复」后记录会显示为「待你确认」，请点击「确认已修复」才算闭环；如果问题仍在，点「仍未修复」会退回待处理。</p><form id="evolution-form"><div class="field"><label>改进建议 / bug 描述（每行一条）</label><textarea name="text" rows="6" data-evolution-input placeholder="每行一条，例如：&#10;终端在手机上无法滚动&#10;建议：服务器列表支持按名称搜索" maxlength="20000"></textarea></div><div class="evolution-form-foot"><span class="evolution-count" data-evolution-count>0 条</span><button class="primary evolution-submit" type="submit">提交</button></div><div class="error" data-evolution-error></div></form><div class="evolution-list-head"><h4>提交记录</h4><button class="secondary" type="button" data-evolution-refresh>刷新</button></div><div class="evolution-list" data-evolution-list><div class="empty">正在加载…</div></div></div></div>`;
+    backdrop.innerHTML = `<div class="modal evolution-modal"><div class="modal-head"><h3>进化</h3><button type="button" class="icon-btn" data-close aria-label="关闭">×</button></div><div class="modal-body"><p class="evolution-hint">每一行提交一条改进建议或一个 bug 描述，提交后保存在服务器数据库中；AI IDE 会在下次开发时读取并针对性优化。AI 标记「已修复」后记录会显示为「待你确认」，请点击「确认已修复」才算闭环；如果问题仍在，点「仍未修复」会退回待处理并累计次数。</p><form id="evolution-form"><div class="field"><label>改进建议 / bug 描述（每行一条）</label><textarea name="text" rows="4" data-evolution-input placeholder="每行一条，例如：&#10;终端在手机上无法滚动&#10;建议：服务器列表支持按名称搜索" maxlength="20000"></textarea></div><div class="evolution-form-foot"><span class="evolution-count" data-evolution-count>0 条</span><button class="primary evolution-submit" type="submit">提交</button></div><div class="error" data-evolution-error></div></form><div class="evolution-list-head"><h4>提交记录</h4><span class="evolution-list-tools"><span class="evolution-pager" data-evolution-pager></span><button class="secondary" type="button" data-evolution-refresh>刷新</button></span></div><div class="evolution-list" data-evolution-list><div class="empty">正在加载…</div></div></div></div>`;
     document.body.appendChild(backdrop);
-    const list = $('[data-evolution-list]', backdrop); const form = $('#evolution-form', backdrop); const input = $('[data-evolution-input]', backdrop); const error = $('[data-evolution-error]', backdrop); const count = $('[data-evolution-count]', backdrop); const submit = $('.evolution-submit', form);
+    const list = $('[data-evolution-list]', backdrop); const form = $('#evolution-form', backdrop); const input = $('[data-evolution-input]', backdrop); const error = $('[data-evolution-error]', backdrop); const count = $('[data-evolution-count]', backdrop); const submit = $('.evolution-submit', form); const pager = $('[data-evolution-pager]', backdrop);
+    const PAGE_SIZE = 10;
+    let allItems = []; let page = 1; let expandedId = '';
     const lineCount = () => input.value.split('\n').map((line) => line.trim()).filter(Boolean).length;
     const updateCount = () => { count.textContent = `${lineCount()} 条`; };
     input.oninput = updateCount;
-    const renderList = (items) => {
-      if (!items.length) { list.innerHTML = '<div class="empty">还没有提交过建议或 bug 描述。</div>'; return; }
-      list.innerHTML = items.map((item) => {
+    // Sort: pending/fixed (needs attention) first, then by newest.
+    const statusRank = (status) => status === 'pending' ? 0 : status === 'fixed' ? 1 : status === 'verified' ? 2 : 3;
+    const sortedItems = () => [...allItems].sort((a, b) => {
+      const rank = statusRank(a.status) - statusRank(b.status);
+      if (rank !== 0) return rank;
+      const ta = new Date(a.createdAt || 0).getTime(); const tb = new Date(b.createdAt || 0).getTime();
+      return tb - ta;
+    });
+    const renderPager = () => {
+      const total = allItems.length;
+      const pages = Math.max(1, Math.ceil(total / PAGE_SIZE));
+      page = Math.min(Math.max(1, page), pages);
+      if (total <= PAGE_SIZE) { pager.innerHTML = total ? `<span>共 ${total} 条</span>` : ''; return; }
+      pager.innerHTML = `<button type="button" class="evolution-page" data-page-prev ${page === 1 ? 'disabled' : ''}>‹</button><span>第 ${page} / ${pages} 页 · 共 ${total} 条</span><button type="button" class="evolution-page" data-page-next ${page === pages ? 'disabled' : ''}>›</button>`;
+      $('[data-page-prev]', backdrop).onclick = () => { page = Math.max(1, page - 1); renderPage(); };
+      $('[data-page-next]', backdrop).onclick = () => { page = Math.min(pages, page + 1); renderPage(); };
+    };
+    const renderPage = () => {
+      renderPager();
+      if (!allItems.length) { list.innerHTML = '<div class="empty">还没有提交过建议或 bug 描述。</div>'; return; }
+      const items = sortedItems();
+      const start = (page - 1) * PAGE_SIZE;
+      const slice = items.slice(start, start + PAGE_SIZE);
+      list.innerHTML = slice.map((item) => {
+        const expanded = item.id === expandedId;
+        const reopenLabel = item.status === 'pending' && item.reopenCount > 0 ? ` · ${item.reopenCount} 次仍未修复` : '';
         const actions = item.status === 'fixed'
           ? '<div class="evolution-actions"><button class="primary evolution-confirm" type="button" data-evolution-verify="' + escapeHtml(item.id) + '" data-action="confirm">确认已修复</button><button class="secondary" type="button" data-evolution-verify="' + escapeHtml(item.id) + '" data-action="reopen">仍未修复</button></div>'
           : item.status === 'verified'
             ? '<div class="evolution-actions"><button class="secondary" type="button" data-evolution-verify="' + escapeHtml(item.id) + '" data-action="reopen">重新打开</button></div>'
             : '';
-        return `<div class="evolution-item ${escapeHtml(item.status)}">${evolutionStatusIcon(item.status)}<div class="evolution-item-main"><p class="evolution-item-text">${escapeHtml(item.text)}</p><div class="evolution-item-meta"><span class="evolution-kind ${escapeHtml(item.kind)}">${item.kind === 'bug' ? 'bug' : '建议'}</span><span>${escapeHtml(EVOLUTION_STATUS_LABELS[item.status] || '待处理')}</span><span>${escapeHtml(new Date(item.createdAt).toLocaleString())}</span>${item.fixedVersion ? `<span>修复于 ${escapeHtml(item.fixedVersion)}</span>` : ''}${item.verifiedAt ? `<span>确认于 ${escapeHtml(new Date(item.verifiedAt).toLocaleString())}</span>` : ''}${item.note ? `<span class="evolution-note">${escapeHtml(item.note)}</span>` : ''}</div>${actions}</div></div>`;
+        const meta = `<span class="evolution-kind ${escapeHtml(item.kind)}">${item.kind === 'bug' ? 'bug' : '建议'}</span><span>${escapeHtml(EVOLUTION_STATUS_LABELS[item.status] || '待处理')}${reopenLabel ? escapeHtml(reopenLabel) : ''}</span><span>${escapeHtml(new Date(item.createdAt).toLocaleString())}</span>`;
+        const detail = `<div class="evolution-detail"><p class="evolution-item-text">${escapeHtml(item.text)}</p><div class="evolution-item-meta">${meta}${item.fixedVersion ? `<span>修复于 ${escapeHtml(item.fixedVersion)}</span>` : ''}${item.verifiedAt ? `<span>确认于 ${escapeHtml(new Date(item.verifiedAt).toLocaleString())}</span>` : ''}${item.note ? `<span class="evolution-note">${escapeHtml(item.note)}</span>` : ''}</div>${actions}</div>`;
+        return `<div class="evolution-item ${escapeHtml(item.status)}${expanded ? ' expanded' : ''}" data-evolution-id="${escapeHtml(item.id)}">${evolutionStatusIcon(item.status)}<div class="evolution-item-main"><button type="button" class="evolution-summary" data-evolution-toggle="${escapeHtml(item.id)}"><span class="evolution-summary-text">${escapeHtml(item.text)}</span><span class="evolution-caret">${expanded ? '▾' : '▸'}</span></button>${expanded ? detail : `<div class="evolution-item-meta collapsed">${meta}</div>`}</div></div>`;
       }).join('');
+      list.querySelectorAll('[data-evolution-toggle]').forEach((button) => {
+        button.onclick = () => { const target = button.dataset.evolutionToggle; expandedId = expandedId === target ? '' : target; renderPage(); };
+      });
       list.querySelectorAll('[data-evolution-verify]').forEach((button) => {
         button.onclick = async () => {
           button.disabled = true;
@@ -1798,15 +1875,9 @@
           } catch (e) { notify(e.message, 'error'); button.disabled = false; }
         };
       });
-      list.querySelectorAll('[data-evolution-delete]').forEach((button) => {
-        button.onclick = async () => {
-          try { await api(`/api/evolutions/${encodeURIComponent(button.dataset.evolutionDelete)}`, { method:'DELETE', body:'{}' }); notify('已删除该条记录'); await loadList(); }
-          catch (e) { notify(e.message, 'error'); }
-        };
-      });
     };
     const loadList = async () => {
-      try { const result = await api('/api/evolutions'); renderList(Array.isArray(result?.items) ? result.items : []); }
+      try { const result = await api('/api/evolutions'); allItems = Array.isArray(result?.items) ? result.items : []; renderPage(); }
       catch (e) { list.innerHTML = `<div class="empty danger">${escapeHtml(e.message)}</div>`; }
     };
     form.onsubmit = async (event) => {
@@ -1817,7 +1888,7 @@
         const result = await api('/api/evolutions', { method:'POST', body:JSON.stringify({ text }) });
         input.value = ''; updateCount();
         notify(`已提交 ${result?.count ?? 0} 条，AI IDE 将在下次开发时处理`);
-        await loadList();
+        page = 1; await loadList();
       } catch (e) { error.textContent = e.message; }
       finally { submit.disabled = false; input.focus(); }
     };
@@ -2023,7 +2094,12 @@
   function openApprovalHistoryModal() {
     const backdrop = document.createElement('div');
     backdrop.className = 'modal-backdrop';
-    backdrop.innerHTML = `<div class="modal approval-modal"><div class="modal-head"><h3>自动审批记录</h3><button type="button" class="icon-btn" data-close aria-label="关闭">×</button></div><div class="modal-body"><div class="approval-history"><h4>最近一次停止</h4><div class="approval-history-list" data-history-stop><div class="empty">正在加载…</div></div><h4>高危人工处理</h4><div class="approval-history-list" data-history-high><div class="empty">正在加载…</div></div><h4>最近模型决定</h4><div class="approval-history-list" data-history-decisions><div class="empty">正在加载…</div></div></div></div><div class="modal-actions"><button type="button" class="secondary" data-close>关闭</button></div></div>`;
+    const live = state.activeTab ? state.tabs.get(state.activeTab) : null;
+    const scopeSessionId = live ? live.id : '';
+    const scopeSessionName = live ? (live.name || '') : '';
+    const scopeHost = live ? (state.servers.find((item) => item.id === live.serverId)?.host || '') : '';
+    const scopeLabel = scopeHost ? `${scopeSessionName || '当前标签'} · ${scopeHost}` : (scopeSessionName || '当前标签');
+    backdrop.innerHTML = `<div class="modal approval-modal"><div class="modal-head"><h3>自动审批记录 · <small style="font-weight:500;color:var(--muted)">${escapeHtml(scopeLabel)}</small></h3><button type="button" class="icon-btn" data-close aria-label="关闭">×</button></div><div class="modal-body"><div class="approval-history"><h4>最近一次停止</h4><div class="approval-history-list" data-history-stop><div class="empty">正在加载…</div></div><h4>高危人工处理</h4><div class="approval-history-list" data-history-high><div class="empty">正在加载…</div></div><h4>最近模型决定</h4><div class="approval-history-list" data-history-decisions><div class="empty">正在加载…</div></div></div></div><div class="modal-actions"><button type="button" class="secondary" data-close>关闭</button></div></div>`;
     document.body.appendChild(backdrop);
     backdrop.querySelectorAll('[data-close]').forEach((button) => button.onclick = () => backdrop.remove());
     const escape = escapeHtml;
@@ -2037,8 +2113,11 @@
     };
     void (async () => {
       let result;
-      try { result = await api('/api/approval-history'); } catch (e) { $('[data-history-high]', backdrop).innerHTML = `<div class="empty">${escape(e.message)}</div>`; $('[data-history-decisions]', backdrop).innerHTML = '<div class="empty">无记录</div>'; return; }
-      const live = state.activeTab ? state.tabs.get(state.activeTab) : null;
+      const qs = new URLSearchParams();
+      if (scopeSessionId) qs.set('sessionId', scopeSessionId);
+      if (scopeSessionName && !scopeSessionId) qs.set('sessionName', scopeSessionName);
+      const qsString = qs.toString();
+      try { result = await api(`/api/approval-history${qsString ? `?${qsString}` : ''}`); } catch (e) { $('[data-history-high]', backdrop).innerHTML = `<div class="empty">${escape(e.message)}</div>`; $('[data-history-decisions]', backdrop).innerHTML = '<div class="empty">无记录</div>'; return; }
       let stopReason = live ? (live.approvalStopReason || '') : '';
       let stopMessage = live ? (live.approvalStopReasonMessage || '') : '';
       let stopModel = ''; let stopRememberAll = false; let liveEnabled = false;

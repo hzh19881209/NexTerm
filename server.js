@@ -577,9 +577,25 @@ function recordApprovalHighRisk(account, { promptBlock, screen, decision, reason
   const clean = (value) => String(value || '').replace(/\s+\n/g, '\n').trim().slice(-APPROVAL_HIGH_RISK_CONTEXT_BYTES);
   const block = clean(promptBlock);
   account.approvalHighRisk.items = [
-    { id: id(), time: now(), block, screen: clean(screen), choice: String(decision?.choice || 'unsafe').slice(0, 32), risk: String(decision?.risk || '').slice(0, 16), modelReason: String(decision?.reason || '').slice(0, 400), humanChoice: '', humanChoiceLabel: '', humanChoiceReason: '', resolvedAt: '' },
+    { id: id(), time: now(), sessionId: String(decision?.sessionId || ''), sessionName: String(decision?.sessionName || ''), block, screen: clean(screen), choice: String(decision?.choice || 'unsafe').slice(0, 32), risk: String(decision?.risk || '').slice(0, 16), modelReason: String(decision?.reason || '').slice(0, 400), humanChoice: '', humanChoiceLabel: '', humanChoiceReason: '', resolvedAt: '' },
     ...(account.approvalHighRisk.items || []),
   ].slice(0, APPROVAL_HIGH_RISK_MAX);
+  writeJson(usersFile, users);
+}
+// Drops every high-risk entry that belongs to the given browser terminal tab
+// (identified by the client-side tab id sent on the WS connect message), or to
+// an older tab whose label no longer exists because it was closed or renamed.
+function clearApprovalHighRisk(account, { sessionId, sessionName } = {}) {
+  if (!account || !account.approvalHighRisk || !Array.isArray(account.approvalHighRisk.items)) return;
+  const byId = String(sessionId || '');
+  const byName = String(sessionName || '');
+  account.approvalHighRisk.items = account.approvalHighRisk.items.filter((item) => {
+    if (byId && item.sessionId === byId) return false;
+    // Legacy entries predate sessionId tracking; they carry no name either.
+    if (!item.sessionId) return true;
+    if (!byName) return false;
+    return item.sessionName !== byName;
+  });
   writeJson(usersFile, users);
 }
 function findHighRiskPrecedent(account, block) {
@@ -712,6 +728,7 @@ function publicEvolution(item) {
     fixedVersion: String(item.fixedVersion || ''),
     // Only a user click sets this; it is what closes the feedback loop.
     verifiedAt: status === 'verified' ? String(item.verifiedAt || '') : '',
+    reopenCount: Math.max(0, Number(item.reopenCount || 0)),
     createdAt: item.createdAt || '',
     updatedAt: item.updatedAt || ''
   };
@@ -1229,10 +1246,27 @@ app.get('/api/servers', auth, passwordChanged, (_req, res) => res.json(servers.m
 // recent window of all AI decisions, so users can audit what the model did.
 app.get('/api/approval-history', auth, passwordChanged, (req, res) => {
   const account = req.account;
-  const highRisk = approvalHighRiskHistory(account).map((entry) => ({
-    id: entry.id, time: entry.time, block: entry.block, choice: entry.choice, risk: entry.risk, modelReason: entry.modelReason,
-    humanChoice: entry.humanChoice, humanChoiceLabel: entry.humanChoiceLabel, humanChoiceReason: entry.humanChoiceReason, resolvedAt: entry.resolvedAt
-  }));
+  // The history is per terminal tab: sessionId is the browser tab id (preferred),
+  // sessionName is the tab label for older sessions. Without either, the
+  // account-wide history is returned (legacy callers).
+  const sessionId = String(req.query.sessionId || '').slice(0, 64);
+  const sessionName = String(req.query.sessionName || '').slice(0, 80);
+  const scoped = Boolean(sessionId || sessionName);
+  const matchesTab = (entry) => {
+    if (!scoped) return true;
+    if (sessionId && entry.sessionId === sessionId) return true;
+    // Legacy entries without a sessionId only match when no id filter is set.
+    if (!entry.sessionId && !sessionId) return true;
+    if (sessionName && entry.sessionName === sessionName) return true;
+    return false;
+  };
+  const highRisk = approvalHighRiskHistory(account)
+    .filter(matchesTab)
+    .map((entry) => ({
+      id: entry.id, time: entry.time, sessionId: String(entry.sessionId || ''), sessionName: String(entry.sessionName || ''),
+      block: entry.block, choice: entry.choice, risk: entry.risk, modelReason: entry.modelReason,
+      humanChoice: entry.humanChoice, humanChoiceLabel: entry.humanChoiceLabel, humanChoiceReason: entry.humanChoiceReason, resolvedAt: entry.resolvedAt
+    }));
   let decisions = [];
   try {
     const data = fs.readFileSync(auditFile, 'utf8');
@@ -1242,16 +1276,31 @@ app.get('/api/approval-history', auth, passwordChanged, (req, res) => {
       if (item.userId !== account.id) continue;
       if (item.type !== 'approval.decision') continue;
       const details = item.details && typeof item.details === 'object' ? item.details : {};
+      const entrySessionId = String(details.tabId || '');
+      const entrySessionName = String(details.tabName || '');
+      if (sessionId && entrySessionId !== sessionId) continue;
+      if (!sessionId && sessionName && entrySessionName && entrySessionName !== sessionName) continue;
+      if (!sessionId && !sessionName) { /* unscoped: keep all */ }
       decisions.push({
         time: item.time, type: item.type, message: item.message,
         choice: String(details.choice || ''), risk: String(details.risk || ''), reason: String(details.reason || ''),
         promptKey: String(details.promptKey || ''), promptBlock: String(details.promptBlock || '').slice(0, 600),
-        serverId: String(details.serverId || '')
+        serverId: String(details.serverId || ''), sessionId: entrySessionId, sessionName: entrySessionName
       });
       if (decisions.length >= 50) break;
     }
   } catch { /* the audit log may not exist yet */ }
   res.json({ highRisk, decisions });
+});
+// Empties the per-tab approval history: used when a tab is closed or its
+// shell exits (the client also detects `/exit` in the terminal output).
+app.post('/api/approval-history/clear', auth, csrf, passwordChanged, (req, res) => {
+  const sessionId = String(req.body?.sessionId || '').slice(0, 64);
+  const sessionName = String(req.body?.sessionName || '').slice(0, 80);
+  if (!sessionId && !sessionName) return res.status(400).json({ error: '缺少标签标识' });
+  clearApprovalHighRisk(req.account, { sessionId, sessionName });
+  auditEvent('approval_history.cleared', req, req.account, '已清空该标签的自动审批记录', { sessionId, sessionName });
+  res.json({ ok: true });
 });
 // --- Evolution feedback API -------------------------------------------------
 // The browser submits one line per suggestion/bug and re-reads the store to
@@ -1293,7 +1342,10 @@ app.post('/api/evolutions/:id/verify', auth, csrf, passwordChanged, (req, res) =
   if (action === 'reopen') {
     if (item.status === 'pending') return res.json({ item: publicEvolution(item) });
     item.status = 'pending'; item.fixedVersion = ''; item.verifiedAt = '';
-    auditEvent('evolution.reopened', req, req.account, '用户确认未修复，已退回待处理', { evolutionId:item.id });
+    // Track how many times the reporter keeps saying "still broken" so the
+    // UI can show "n 次仍未修复" on the next pass.
+    item.reopenCount = Math.max(0, Number(item.reopenCount || 0)) + 1;
+    auditEvent('evolution.reopened', req, req.account, '用户确认未修复，已退回待处理', { evolutionId:item.id, reopenCount:item.reopenCount });
   } else {
     if (item.status !== 'fixed') return res.status(409).json({ error: '只有标记为已修复的记录才能确认' });
     item.status = 'verified'; item.verifiedAt = now();
@@ -1829,14 +1881,14 @@ async function evaluateSessionApproval(session) {
   // it records a high-risk entry and arms the key watcher to store whatever the
   // user actually presses.
   if (decision.choice === 'unsafe' || decision.choice === 'deny' || decision.risk === 'high' || decision.risk === 'critical') {
-    const entry = { id: id(), time: now(), block: String(state.block || '').replace(/\s+\n/g, '\n').trim().slice(-APPROVAL_HIGH_RISK_CONTEXT_BYTES), screen: String(screen || '').replace(/\s+\n/g, '\n').trim().slice(-APPROVAL_HIGH_RISK_CONTEXT_BYTES), choice: decision.choice, risk: decision.risk, modelReason: String(decision.reason || '').slice(0, 400), promptKey, humanChoice: '', humanChoiceLabel: '', humanChoiceReason: '', resolvedAt: '' };
+    const entry = { id: id(), time: now(), sessionId: session.tabId || '', sessionName: session.tabName || '', block: String(state.block || '').replace(/\s+\n/g, '\n').trim().slice(-APPROVAL_HIGH_RISK_CONTEXT_BYTES), screen: String(screen || '').replace(/\s+\n/g, '\n').trim().slice(-APPROVAL_HIGH_RISK_CONTEXT_BYTES), choice: decision.choice, risk: decision.risk, modelReason: String(decision.reason || '').slice(0, 400), promptKey, humanChoice: '', humanChoiceLabel: '', humanChoiceReason: '', resolvedAt: '' };
     if (!account.approvalHighRisk || typeof account.approvalHighRisk !== 'object') account.approvalHighRisk = { items: [] };
     account.approvalHighRisk.items = [entry, ...(account.approvalHighRisk.items || [])].slice(0, APPROVAL_HIGH_RISK_MAX);
     writeJson(usersFile, users);
     session.approvalHighRiskPrompt = { promptKey, entryId: entry.id };
   }
   auditEvent('approval.decision', null, account, `审批模型 ${model.name} 决定：${label}`, {
-    sessionId:session.id, serverId:session.serverId, choice:decision.choice, risk:decision.risk, reason:decision.reason, promptKey,
+    sessionId:session.id, serverId:session.serverId, tabId:session.tabId || '', tabName:session.tabName || '', choice:decision.choice, risk:decision.risk, reason:decision.reason, promptKey,
     // Without the pending command in the log, a wrong `unsafe` verdict cannot be
     // traced back to what the model actually saw.
     promptBlock: String(state.block || '').slice(0, 1_000)
@@ -2092,7 +2144,7 @@ function attachVncSession(session, ws) {
 function createSshSession({ sessionId, ownerId, serverId, ws, cols, rows, initialCwd }) {
   const target = findServer(serverId);
   const directory = normalizeInitialCwd(initialCwd);
-  const session = { id: sessionId, ownerId, serverId, ws, client: null, stream: null, connected: false, destroyed: false, seq: 0, screen: null, snapshotPending: null, detachTimer: null, tabName: String(ws?.tabName || '').slice(0, 80), approval: { enabled:false, modelId:'', rememberAll:false, attempts:0 }, approvalStopReason: '', approvalTimer: null, approvalFrames: 0, approvalLastScreen: '', approvalPending: null, approvalResolving: false, approvalHighRiskPrompt: null, highRiskInput: '', lastApprovalAt: '', lastApprovalKeys: '', initialCwd: directory, currentDirectory: directory, shellPid: null, startupParsed: false, startupBuffer: Buffer.alloc(0), createdAt: now(), lastOutputAt: '', detachedAt: '' };
+  const session = { id: sessionId, ownerId, serverId, ws, client: null, stream: null, connected: false, destroyed: false, seq: 0, screen: null, snapshotPending: null, detachTimer: null, tabId: String(ws?.tabId || '').slice(0, 64), tabName: String(ws?.tabName || '').slice(0, 80), approval: { enabled:false, modelId:'', rememberAll:false, attempts:0 }, approvalStopReason: '', approvalTimer: null, approvalFrames: 0, approvalLastScreen: '', approvalPending: null, approvalResolving: false, approvalHighRiskPrompt: null, highRiskInput: '', lastApprovalAt: '', lastApprovalKeys: '', initialCwd: directory, currentDirectory: directory, shellPid: null, startupParsed: false, startupBuffer: Buffer.alloc(0), createdAt: now(), lastOutputAt: '', detachedAt: '' };
   resizeSshSession(session, cols, rows);
   session.screen = new TerminalScreen(session.cols, session.rows);
   sshSessions.set(session.id, session);
@@ -2183,6 +2235,7 @@ wss.on('connection', (ws, authContext) => {
         let session = useVnc ? vncSessions.get(requestedId) : sshSessions.get(requestedId);
         if (session && (session.ownerId !== ownerId || session.serverId !== target.id)) return send({ type: 'error', message: '会话归属不匹配', fatal: true });
         ws.tabName = typeof message.tabName === 'string' ? message.tabName.slice(0, 80) : '';
+        ws.tabId = typeof message.tabId === 'string' ? message.tabId.slice(0, 64) : '';
         if (useVnc) {
           if (!session) session = createVncSession({ sessionId: requestedId, ownerId, serverId: target.id, ws });
           else attachVncSession(session, ws);
@@ -2190,7 +2243,7 @@ wss.on('connection', (ws, authContext) => {
           if (session.connected) send({ type: 'connected', sessionId: session.id, resumed: true, width: 0, height: 0 });
         } else {
           if (!session) session = createSshSession({ sessionId: requestedId, ownerId, serverId: target.id, ws, cols: message.cols, rows: message.rows, initialCwd: message.initialCwd });
-          else { attachSshSession(session, ws, message.cols, message.rows); if (ws.tabName) session.tabName = ws.tabName; }
+          else { attachSshSession(session, ws, message.cols, message.rows); if (ws.tabName) session.tabName = ws.tabName; if (ws.tabId) session.tabId = ws.tabId; }
           boundSessionId = session.id;
           if (session.connected) send({ type: 'connected', sessionId: session.id, resumed: true });
           if (session.approval?.enabled) send({ type:'approval', action:'state', enabled:true, modelId: session.approval.modelId, rememberAll: Boolean(session.approval.rememberAll) });
