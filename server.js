@@ -1787,11 +1787,14 @@ function approvalStopReasonLabel(reason) {
 }
 function stopSessionApproval(session, reason = 'stopped') {
   if (!session) return;
+  session.approvalGeneration = Number(session.approvalGeneration || 0) + 1;
   session.approval = { enabled:false, modelId: String(session.approval?.modelId || ''), rememberAll: Boolean(session.approval?.rememberAll) };
+  session.approvalStopReason = reason;
   if (session.approvalTimer) { clearTimeout(session.approvalTimer); session.approvalTimer = null; }
   session.approvalPending = null;
   session.approvalFrames = 0;
   session.approvalLastScreen = '';
+  session.approvalResolving = false;
   // A high-risk / deny prompt is still waiting on the human, so keep the
   // terminal key watcher armed: record whichever menu option the user actually
   // presses (or mark it resolved later when the prompt disappears). Do not
@@ -1802,6 +1805,21 @@ function stopSessionApproval(session, reason = 'stopped') {
   }
   approvalSend(session, { action:'state', enabled:false, reason, message: approvalStopReasonLabel(reason) });
 }
+function approvalStateMessage(session, requestId = '') {
+  const account = users.find((item) => item.id === session.ownerId) || {};
+  const model = findApprovalModel(account, String(session.approval?.modelId || '')) || null;
+  const stopReason = String(session.approvalStopReason || '');
+  const message = {
+    type:'approval', action:'state', enabled:Boolean(session.approval?.enabled),
+    modelId:String(session.approval?.modelId || ''),
+    modelName:model ? approvalMaskSecrets(model.name) : '',
+    model:model ? approvalMaskSecrets(model.model) : '',
+    rememberAll:Boolean(session.approval?.rememberAll), stopReason,
+    reason:stopReason, message:stopReason ? approvalStopReasonLabel(stopReason) : ''
+  };
+  if (requestId) message.requestId = requestId;
+  return message;
+}
 function scheduleApprovalScan(session, delay = APPROVAL_SETTLE_MS) {
   if (!session || session.destroyed || !session.approval?.enabled) return;
   if (session.approvalTimer) clearTimeout(session.approvalTimer);
@@ -1809,6 +1827,7 @@ function scheduleApprovalScan(session, delay = APPROVAL_SETTLE_MS) {
 }
 async function evaluateSessionApproval(session) {
   if (!session || session.destroyed || !session.approval?.enabled) return;
+  const approvalGeneration = Number(session.approvalGeneration || 0);
   const state = sessionPromptState(session);
   if (!state.inputRequired) {
     session.approvalFrames = 0; session.approvalLastScreen = ''; session.approvalPending = null;
@@ -1852,6 +1871,10 @@ async function evaluateSessionApproval(session) {
     decision = parseApprovalDecision(content);
     if (!decision) failure = '模型返回内容无法解析';
   } catch (error) { failure = error.message || '模型请求失败'; }
+  // Reconnects and model changes can start a new approval generation while
+  // this request is still in flight. Do not let an old reply clear the new
+  // generation's in-flight guard or apply a stale decision.
+  if (approvalGeneration !== Number(session.approvalGeneration || 0)) return;
   session.approvalResolving = false;
 
   if (session.destroyed || !session.approval?.enabled) return;
@@ -1927,7 +1950,19 @@ function startSessionApproval(session, modelId) {
   if (!account) return { error:'账户不存在' };
   const model = findApprovalModel(account, String(modelId || '')) || approvalModels(account).find((item) => item.enabled !== false) || null;
   if (!model) return { error:'请先在设置中添加审批模型' };
+  // Reconnects (including browser refreshes) re-send "enable". Treat an
+  // already-running identical configuration as a state query, not a reset:
+  // resetting approvalResolving here would launch a second model request while
+  // the first one is still in flight.
+  if (session.approval?.enabled && String(session.approval.modelId || '') === model.id) {
+    session.approvalStopReason = '';
+    approvalSend(session, { action:'state', enabled:true, modelId:model.id, modelName:approvalMaskSecrets(model.name), model:approvalMaskSecrets(model.model), rememberAll:Boolean(session.approval.rememberAll), stopReason:'' });
+    if (!session.approvalTimer && !session.approvalResolving) scheduleApprovalScan(session, 300);
+    return { model: publicApprovalModel(model) };
+  }
+  session.approvalGeneration = Number(session.approvalGeneration || 0) + 1;
   session.approval = { enabled:true, modelId:model.id, rememberAll:false, attempts:0 };
+  session.approvalStopReason = '';
   if (session.approvalTimer) clearTimeout(session.approvalTimer);
   session.approvalFrames = 0; session.approvalLastScreen = ''; session.approvalPending = null; session.approvalResolving = false;
   auditEvent('approval.enabled', null, account, '已开启终端自动审批', { sessionId:session.id, serverId:session.serverId, modelId:model.id, modelName:model.name });
@@ -2144,7 +2179,7 @@ function attachVncSession(session, ws) {
 function createSshSession({ sessionId, ownerId, serverId, ws, cols, rows, initialCwd }) {
   const target = findServer(serverId);
   const directory = normalizeInitialCwd(initialCwd);
-  const session = { id: sessionId, ownerId, serverId, ws, client: null, stream: null, connected: false, destroyed: false, seq: 0, screen: null, snapshotPending: null, detachTimer: null, tabId: String(ws?.tabId || '').slice(0, 64), tabName: String(ws?.tabName || '').slice(0, 80), approval: { enabled:false, modelId:'', rememberAll:false, attempts:0 }, approvalStopReason: '', approvalTimer: null, approvalFrames: 0, approvalLastScreen: '', approvalPending: null, approvalResolving: false, approvalHighRiskPrompt: null, highRiskInput: '', lastApprovalAt: '', lastApprovalKeys: '', initialCwd: directory, currentDirectory: directory, shellPid: null, startupParsed: false, startupBuffer: Buffer.alloc(0), createdAt: now(), lastOutputAt: '', detachedAt: '' };
+  const session = { id: sessionId, ownerId, serverId, ws, client: null, stream: null, connected: false, destroyed: false, seq: 0, screen: null, snapshotPending: null, detachTimer: null, tabId: String(ws?.tabId || '').slice(0, 64), tabName: String(ws?.tabName || '').slice(0, 80), approval: { enabled:false, modelId:'', rememberAll:false, attempts:0 }, approvalGeneration: 0, approvalStopReason: '', approvalTimer: null, approvalFrames: 0, approvalLastScreen: '', approvalPending: null, approvalResolving: false, approvalHighRiskPrompt: null, highRiskInput: '', lastApprovalAt: '', lastApprovalKeys: '', initialCwd: directory, currentDirectory: directory, shellPid: null, startupParsed: false, startupBuffer: Buffer.alloc(0), createdAt: now(), lastOutputAt: '', detachedAt: '' };
   resizeSshSession(session, cols, rows);
   session.screen = new TerminalScreen(session.cols, session.rows);
   sshSessions.set(session.id, session);
@@ -2245,8 +2280,16 @@ wss.on('connection', (ws, authContext) => {
           if (!session) session = createSshSession({ sessionId: requestedId, ownerId, serverId: target.id, ws, cols: message.cols, rows: message.rows, initialCwd: message.initialCwd });
           else { attachSshSession(session, ws, message.cols, message.rows); if (ws.tabName) session.tabName = ws.tabName; if (ws.tabId) session.tabId = ws.tabId; }
           boundSessionId = session.id;
-          if (session.connected) send({ type: 'connected', sessionId: session.id, resumed: true });
-          if (session.approval?.enabled) send({ type:'approval', action:'state', enabled:true, modelId: session.approval.modelId, rememberAll: Boolean(session.approval.rememberAll) });
+          if (session.connected) {
+            // Always send the authoritative state on resume. A page reload must
+            // not silently restart approval that the server has already stopped,
+            // and it must not need a second "enable" request when it is running.
+            // Send it before "connected": the client's connected handler may
+            // schedule an enable in the next animation frame, and the state must
+            // win that race so a stopped approval stays stopped.
+            send(approvalStateMessage(session));
+            send({ type: 'connected', sessionId: session.id, resumed: true });
+          }
         }
       } else if (message.type === 'input') {
         if (typeof message.data !== 'string' || message.data.length > 512 * 1024) return send({ type: 'error', message: '输入数据无效' });
@@ -2305,9 +2348,8 @@ wss.on('connection', (ws, authContext) => {
         } else if (action === 'disable') {
           stopSessionApproval(session, 'client-disabled');
         } else if (action === 'status') {
-          const enabled = Boolean(session.approval?.enabled);
-          const model = findApprovalModel(users.find((item) => item.id === ownerId) || {}, String(session.approval?.modelId || '')) || null;
-          send({ type:'approval', action:'state', enabled, modelId: session.approval?.modelId || '', modelName: model ? approvalMaskSecrets(model.name) : '', model: model ? approvalMaskSecrets(model.model) : '', rememberAll: Boolean(session.approval?.rememberAll), stopReason: session.approvalStopReason || '' });
+          const requestId = typeof message.requestId === 'string' ? message.requestId.slice(0, 128) : '';
+          send(approvalStateMessage(session, requestId));
         } else {
           send({ type:'approval', action:'error', reason:'unsupported', message:'不支持的审批操作' });
         }

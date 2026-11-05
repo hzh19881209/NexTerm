@@ -154,7 +154,7 @@
     const style = serverColor ? ` style="--connection-color:${serverColor}"` : '';
     return `<svg class="connection-icon ${connected ? 'connected' : 'disconnected'}${attention ? ' attention' : ''}${auto ? ' auto' : ''}${serverColor ? ' has-server-color' : ''}"${style} viewBox="0 0 24 24" role="img" aria-label="${auto ? '自动审批已开启（点击关闭）' : '点击开启自动审批'}"><path class="connection-bolt" d="M13.7 2.5 5.4 13.3h6.2l-1.3 8.2 8.3-11h-6.2l1.3-8Z"/>${connected ? '' : '<path class="connection-slash" d="M4.5 4.5 19.5 19.5"/>'}</svg>`;
   };
-  const CLIENT_BUILD_TAG = 'nexterm-evolution-24-codex-running-indicator';
+  const CLIENT_BUILD_TAG = 'nexterm-evolution-25-approval-reconnect-tab-fix';
   const notify = (message, type = 'info') => {
     const toast = document.createElement('div'); toast.textContent = message; toast.style.cssText = `position:fixed;right:18px;bottom:18px;z-index:30;background:${type === 'error' ? '#4d2029' : '#17372f'};border:1px solid ${type === 'error' ? '#9d4656' : '#2b8067'};color:#e8fff7;padding:11px 14px;border-radius:9px;font-size:13px;box-shadow:0 10px 30px #0005`;
     document.body.appendChild(toast); setTimeout(() => toast.remove(), 3000);
@@ -400,7 +400,7 @@
     const initialCwd = String(options.initialCwd || options.currentDirectory || '');
     const approvalEnabled = options.approvalEnabled === true;
     const approvalRememberAll = options.approvalRememberAll === true;
-    return { id:options.id || crypto.randomUUID(), serverId:server.id, name:String(options.name || server.name), initialCwd, currentDirectory:String(options.currentDirectory || initialCwd), kind, vnc:null, connected:false, ws:null, wsGeneration:0, reconnectBlocked:false, terminal:null, fit:null, resizeFrame:null, sftp:false, upload:null, lastSeq:0, restoring:false, restoreGeneration:0, reconnectTimer:null, reconnectAttempt:0, manualClose:false, needsAttention:false, attentionTimer:null, taskWasWorking:false, lastCompletionKey:'', cwdRequests:new Map(), cwdRequestInFlight:false, followOutput:true, approvalEnabled:kind === 'ssh' && approvalEnabled, approvalModelId:kind === 'ssh' ? String(options.approvalModelId || '') : '', approvalRememberAll, approvalStatus:'', approvalStatusTimer:null, approvalNotice:'', approvalStopReason:'', approvalStopReasonMessage:'' };
+    return { id:options.id || crypto.randomUUID(), serverId:server.id, name:String(options.name || server.name), initialCwd, currentDirectory:String(options.currentDirectory || initialCwd), kind, vnc:null, connected:false, ws:null, wsGeneration:0, reconnectBlocked:false, terminal:null, fit:null, resizeFrame:null, sftp:false, upload:null, lastSeq:0, restoring:false, restoreGeneration:0, reconnectTimer:null, reconnectAttempt:0, manualClose:false, needsAttention:false, attentionTimer:null, taskWasWorking:false, lastCompletionKey:'', cwdRequests:new Map(), cwdRequestInFlight:false, approvalStateRequests:new Map(), approvalStateSynced:false, followOutput:true, approvalEnabled:kind === 'ssh' && approvalEnabled, approvalModelId:kind === 'ssh' ? String(options.approvalModelId || '') : '', approvalRememberAll, approvalStatus:'', approvalStatusTimer:null, approvalNotice:'', approvalStopReason:'', approvalStopReasonMessage:'' };
   }
   function persistSessions() {
     localStorage.setItem(SESSION_STORAGE_KEY, JSON.stringify({ activeTab:state.activeTab, tabs:[...state.tabs.values()].map((tab) => ({ id:tab.id, serverId:tab.serverId, name:tab.name, kind:tab.kind === 'vnc' ? 'vnc' : 'ssh', initialCwd:tab.currentDirectory || tab.initialCwd || '', approvalEnabled:tab.approvalEnabled === true, approvalModelId:tab.approvalModelId || '', approvalRememberAll:tab.approvalRememberAll === true })) }));
@@ -837,6 +837,15 @@
   function renderTabs() {
     const tabs = $('#tabs'); if (!tabs) return; stopTabDrag(); const scrollLeft = tabs.scrollLeft;
     const tabMarkup = [...state.tabs.values()].map((tab) => { const server = state.servers.find((item) => item.id === tab.serverId); return `<div class="tab ${tab.id === state.activeTab ? 'active' : ''}${tab.approvalEnabled ? ' auto-approval' : ''}${tab.taskWasWorking ? ' working' : ''}" data-tab="${tab.id}" title="${escapeHtml(tab.name)}"><button type="button" class="tab-drag-handle${tab.approvalEnabled ? ' auto' : ''}" data-tab-drag data-approval-toggle="${tab.id}" title="${tab.approvalEnabled ? '自动审批已开启，点击关闭（长按可拖动排序）' : '点击开启自动审批（长按可拖动排序）'}" aria-label="长按拖动 ${escapeHtml(tab.name)} 标签排序" aria-pressed="${tab.approvalEnabled ? 'true' : 'false'}">${connectionIcon(tab.connected, tab.needsAttention, server?.color, tab.approvalEnabled)}</button>${tab.taskWasWorking ? '<span class="tab-working-dot" title="Codex 正在运行" aria-label="Codex 正在运行"></span>' : ''}<span class="tab-name">${escapeHtml(tab.name)}</span><button type="button" class="close" data-close="${tab.id}" title="关闭 ${escapeHtml(tab.name)}" aria-label="关闭 ${escapeHtml(tab.name)}">×</button></div>`; }).join('');
+    // Codex redraws several times a second. Replacing identical markup during
+    // a click swaps the pointerdown target out from under the browser, making
+    // tab switching look dead. Only rebuild when a rendered attribute changed.
+    if (tabs._renderedTabMarkup === tabMarkup && tabs.childElementCount) {
+      tabs.scrollLeft = scrollLeft;
+      requestAnimationFrame(updateTabOverflowControls);
+      return;
+    }
+    tabs._renderedTabMarkup = tabMarkup;
     tabs.innerHTML = tabMarkup; tabs.scrollLeft = scrollLeft;
     tabs.querySelectorAll('[data-tab]').forEach((node) => node.onclick = (event) => {
       if (event.target.closest('[data-close]')) return;
@@ -946,8 +955,32 @@
     tab.ws.send(JSON.stringify({ type:'approval', action, ...extra }));
     return true;
   }
+  function requestApprovalState(tab, timeoutMs = 1500) {
+    if (!tab?.ws || tab.ws.readyState !== WebSocket.OPEN) return Promise.resolve(null);
+    const requestId = crypto.randomUUID();
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        tab.approvalStateRequests?.delete(requestId);
+        resolve(null);
+      }, timeoutMs);
+      tab.approvalStateRequests?.set(requestId, { resolve, timer });
+      if (!sendApprovalControl(tab, 'status', { requestId })) {
+        clearTimeout(timer);
+        tab.approvalStateRequests?.delete(requestId);
+        resolve(null);
+      }
+    });
+  }
+  function resolveApprovalStateRequests(tab) {
+    tab.approvalStateRequests?.forEach((pending) => { clearTimeout(pending.timer); pending.resolve(null); });
+    tab.approvalStateRequests?.clear();
+  }
   async function enableTabApproval(tab, options = {}) {
     if (!tab || !state.tabs.has(tab.id)) return;
+    // A reconnect may race with the server's authoritative approval state. If
+    // that state has already arrived and says approval is stopped, do not
+    // silently restart it just because localStorage still held the old toggle.
+    if (options.silent && !options.force && tab.approvalStateSynced) return;
     const models = state.user?.approvalModels || [];
     if (!models.length) {
       tab.approvalEnabled = false; persistSessions(); renderTabs();
@@ -985,12 +1018,21 @@
     if (!tab || tab.kind !== 'ssh') return;
     if (tab.approvalEnabled) return;
     tab.approvalStopReason = ''; tab.approvalStopReasonMessage = '';
-    void enableTabApproval(tab, { silent: true });
+    void enableTabApproval(tab, { silent: true, force: true });
   }
   function handleApprovalMessage(tab, message) {
     if (!tab) return;
     const action = message.action;
+    if (message.requestId) {
+      const pending = tab.approvalStateRequests?.get(message.requestId);
+      if (pending) {
+        clearTimeout(pending.timer);
+        tab.approvalStateRequests.delete(message.requestId);
+        pending.resolve(message);
+      }
+    }
     if (action === 'state') {
+      tab.approvalStateSynced = true;
       tab.approvalEnabled = message.enabled === true;
       tab.approvalModelId = message.modelId || tab.approvalModelId;
       tab.approvalRememberAll = Boolean(message.rememberAll);
@@ -1046,8 +1088,30 @@
   // Mirror the live Codex status of every tab into cheap UI signals:
   // the tab-strip "working" dot, the browser tab title, and the animated
   // favicon.  Called on every recognized status transition.
+  function syncTabWorkingIndicators() {
+    const tabs = $('#tabs'); if (!tabs) return;
+    let changed = false;
+    tabs.querySelectorAll('[data-tab]').forEach((node) => {
+      const tab = state.tabs.get(node.dataset.tab); if (!tab) return;
+      const working = Boolean(tab.taskWasWorking);
+      node.classList.toggle('working', working);
+      let dot = node.querySelector('.tab-working-dot');
+      if (working && !dot) {
+        dot = document.createElement('span');
+        dot.className = 'tab-working-dot';
+        dot.title = 'Codex 正在运行';
+        dot.setAttribute('aria-label', 'Codex 正在运行');
+        node.insertBefore(dot, node.querySelector('.tab-name'));
+        changed = true;
+      } else if (!working && dot) {
+        dot.remove();
+        changed = true;
+      }
+    });
+    if (changed) requestAnimationFrame(updateTabOverflowControls);
+  }
   function refreshRunningIndicators() {
-    if (typeof renderTabs === 'function') renderTabs();
+    syncTabWorkingIndicators();
     let workingTabs = [];
     let waitingTabs = [];
     if (typeof latestCodexStatus === 'function') {
@@ -1215,6 +1279,7 @@
   function resolveCwdRequests(tab, fallback = '') {
     tab.cwdRequests?.forEach((pending) => { clearTimeout(pending.timer); pending.resolve(fallback); });
     tab.cwdRequests?.clear();
+    resolveApprovalStateRequests(tab);
   }
   function requestTabCwd(tab) {
     const fallback = tab.currentDirectory || tab.initialCwd || '';
@@ -1361,6 +1426,7 @@ function closeTab(tabId) { const tab = state.tabs.get(tabId); if (!tab) return; 
   }
   function connectTab(tab) {
     if (tab.manualClose || tab.reconnectBlocked || (tab.ws && tab.ws.readyState <= WebSocket.OPEN)) return;
+    tab.approvalStateSynced = false;
     const server = state.servers.find((item) => item.id === tab.serverId); if (!server) return;
     if (tab.kind === 'vnc') { if (!tab.view || !tab.vnc) createTabView(tab); return connectVncTab(tab, server); }
     if (!tab.view) createTabView(tab);
@@ -1634,7 +1700,7 @@ function closeTab(tabId) { const tab = state.tabs.get(tabId); if (!tab) return; 
     const server = state.servers.find((item) => item.id === tab.serverId);
     if (tab.kind === 'vnc') return createVncTabView(tab, server);
     const view = document.createElement('div'); view.className = tab.id === state.activeTab ? 'session' : 'session hidden'; view.dataset.sessionId = tab.id; view.innerHTML = `<div class="terminal-wrap"><div class="terminal"></div></div><div class="keybar"><button data-key="\u001b">ESC</button><button data-key="\t">TAB</button><button data-key="\u0003">CTRL+C</button><button data-key="\u0004">CTRL+D</button><button data-key="\u0009">⇥</button><button data-key="\u001b[A">↑</button><button data-key="\u001b[B">↓</button><button data-key="\u001b[D">←</button><button data-key="\u001b[C">→</button></div><div class="session-bar"><span>${escapeHtml(server.host)} · ${escapeHtml(server.username)}</span><span class="approval-badge hidden" role="button" tabindex="0" data-approval-history title="点击查看自动审批记录" aria-label="查看自动审批记录"></span><button class="approval-history-link hidden" data-approval-history title="查看自动审批记录（点击展开）" aria-label="查看自动审批记录">记录</button><span class="grow"></span><button class="ghost-btn session-action" data-sftp title="打开 SFTP 文件管理">${ICONS.sftp}<span>SFTP</span></button><button class="ghost-btn session-action" data-reconnect title="重新连接 SSH 会话">${ICONS.reconnect}<span>重新连接</span></button></div><div class="sftp-panel hidden"><div class="sftp-toolbar"><button class="ghost-btn" data-up>←</button><input class="path-input" value="/" /><button class="ghost-btn" data-refresh>刷新</button><button class="ghost-btn" data-mkdir>新建目录</button><label class="ghost-btn" style="cursor:pointer">上传<input type="file" data-upload multiple hidden /></label><label class="ghost-btn" style="cursor:pointer">上传文件夹<input type="file" data-upload-directory webkitdirectory directory multiple hidden /></label><button class="ghost-btn" type="button" data-sftp-close title="关闭文件面板">关闭</button></div><div class="upload-status hidden" data-upload-status role="status" aria-live="polite"><div class="upload-meta"><span data-upload-label>准备上传</span><span class="upload-percent" data-upload-percent>0%</span><button class="secondary danger" type="button" data-upload-cancel>取消上传</button></div><progress data-upload-progress max="100" value="0"></progress><div class="upload-detail" data-upload-detail></div></div><div class="file-list"><div class="file-row head"><span>名称</span><span>大小</span><span>修改时间</span><span></span></div><div data-files></div></div></div>`;
-    $('#content').appendChild(view); tab.view = view; const terminalElement = $('.terminal', view); tab.terminal = window.Terminal ? new window.Terminal({ cursorBlink:true, scrollback:10000, fontSize:Math.max(11, Math.min(24, Number(state.user?.preferences?.terminalFontSize) || 13)), fontFamily:'"SFMono-Regular",Consolas,"Liberation Mono","Noto Sans Mono CJK SC",monospace', rescaleOverlappingGlyphs:true, rightClickSelectsWord:false, theme:{ background:'#0b1119', foreground:'#d8e4f0', cursor:'#66e3b4', selectionBackground:'#27536a' }, convertEol:true }) : null; if (tab.terminal) { tab.fit = window.FitAddon ? new window.FitAddon.FitAddon() : null; tab.fit && tab.terminal.loadAddon(tab.fit); tab.terminal.open(terminalElement); tab.terminal.attachCustomKeyEventHandler((event) => { if (event.type !== 'keydown') return true; const key = String(event.key || '').toLowerCase(); const modifier = event.ctrlKey || event.metaKey; const plainCopy = (event.ctrlKey && event.shiftKey || event.metaKey && !event.ctrlKey) && key === 'c'; const copySelection = modifier && key === 'c' && !event.shiftKey && !event.altKey && !!String(tab.terminal?.getSelection?.() || ''); if (plainCopy || copySelection) { event.preventDefault(); event.stopPropagation(); void copyTerminalSelection(tab); return false; } if (modifier && key === 'v' && !event.altKey) { event.preventDefault(); event.stopPropagation(); void (async () => { let clipboardText = ''; try { if (navigator.clipboard?.readText) clipboardText = await navigator.clipboard.readText(); } catch { clipboardText = ''; } if (!clipboardText) { notify('无法读取剪贴板，请使用鼠标右键粘贴', 'error'); return; } if (hasMultipleLines(clipboardText) && !(await confirmMultilinePaste(clipboardText))) return; pasteIntoTerminal(tab, clipboardText); })(); return false; } return true; }); if (tab.id === state.activeTab) requestAnimationFrame(() => requestAnimationFrame(() => { if (!view.classList.contains('hidden')) { fitTerminal(tab); sendResize(tab); scrollTerminalToBottom(tab, true); } })); tab.terminal.onData((data) => { if (tab.restoring) return; if (terminalUserScrolling(tab)) return; tab.followOutput = true; if (tab.ws?.readyState === WebSocket.OPEN) tab.ws.send(JSON.stringify({ type:'input', data:btoa(unescape(encodeURIComponent(data))) })); if (!terminalAtBottom(tab)) requestAnimationFrame(() => { if (tab.followOutput !== false && !terminalUserScrolling(tab)) { tab.terminal?.scrollToBottom?.(); tab.terminal?.refresh(0, Math.max(0, tab.terminal.rows - 1)); } }); });
+    $('#content').appendChild(view); tab.view = view; const terminalElement = $('.terminal', view); tab.terminal = window.Terminal ? new window.Terminal({ cursorBlink:true, scrollback:10000, fontSize:Math.max(11, Math.min(24, Number(state.user?.preferences?.terminalFontSize) || 13)), fontFamily:'"SFMono-Regular",Consolas,"Liberation Mono","Noto Sans Mono CJK SC",monospace', rescaleOverlappingGlyphs:true, rightClickSelectsWord:false, theme:{ background:'#0b1119', foreground:'#d8e4f0', cursor:'#66e3b4', selectionBackground:'#27536a' }, convertEol:true }) : null; if (tab.terminal) { tab.fit = window.FitAddon ? new window.FitAddon.FitAddon() : null; tab.fit && tab.terminal.loadAddon(tab.fit); tab.terminal.open(terminalElement); tab.terminal.attachCustomKeyEventHandler((event) => { if (event.type !== 'keydown') return true; const key = String(event.key || '').toLowerCase(); const modifier = event.ctrlKey || event.metaKey; const plainCopy = (event.ctrlKey && event.shiftKey || event.metaKey && !event.ctrlKey) && key === 'c'; const copySelection = modifier && key === 'c' && !event.shiftKey && !event.altKey && !!String(tab.terminal?.getSelection?.() || ''); if (plainCopy || copySelection) { event.preventDefault(); event.stopPropagation(); void copyTerminalSelection(tab); return false; } if (modifier && key === 'v' && !event.altKey) { event.preventDefault(); event.stopPropagation(); void (async () => { let clipboardText = ''; try { if (navigator.clipboard?.readText) clipboardText = await navigator.clipboard.readText(); } catch { clipboardText = ''; } if (!clipboardText) { notify('无法读取剪贴板，请使用鼠标右键粘贴', 'error'); return; } if (hasMultipleLines(clipboardText) && !(await confirmMultilinePaste(clipboardText))) return; pasteIntoTerminal(tab, clipboardText); })(); return false; } return true; }); if (tab.id === state.activeTab) requestAnimationFrame(() => requestAnimationFrame(() => { if (!view.classList.contains('hidden')) { fitTerminal(tab); sendResize(tab); scrollTerminalToBottom(tab, true); } })); tab.terminal.onData((data) => { if (tab.restoring) return; tab.followOutput = true; if (tab.ws?.readyState === WebSocket.OPEN) tab.ws.send(JSON.stringify({ type:'input', data:btoa(unescape(encodeURIComponent(data))) })); if (!terminalAtBottom(tab)) requestAnimationFrame(() => { if (tab.followOutput !== false && !terminalUserScrolling(tab)) { tab.terminal?.scrollToBottom?.(); tab.terminal?.refresh(0, Math.max(0, tab.terminal.rows - 1)); } }); });
       // Scrolling the scrollback has to win against the live tail, otherwise the
       // view snaps back down on the next output chunk and upward wheel/touch
       // motion looks completely dead.  That fight is decided here:
@@ -2143,7 +2209,7 @@ function closeTab(tabId) { const tab = state.tabs.get(tabId); if (!tab) return; 
       let stopModel = ''; let stopRememberAll = false; let liveEnabled = false;
       if (live && live.kind === 'ssh') {
         try {
-          const st = await new Promise((resolve) => { let settled = false; let timer = null; const done = (value) => { if (settled) return; settled = true; if (timer) clearTimeout(timer); resolve(value); }; timer = setTimeout(() => done(null), 1500); const ws = live.ws; if (!ws || ws.readyState !== WebSocket.OPEN) return done(null); ws.onmessage = (event) => { try { const msg = JSON.parse(event.data); if (msg && msg.type === 'approval' && msg.action === 'state') done(msg); } catch { /* ignore */ } }; sendApprovalControl(live, 'status'); });
+          const st = await requestApprovalState(live, 1500);
           if (st && st.action === 'state') { stopReason = st.stopReason || stopReason; stopMessage = st.message || stopMessage; stopModel = st.modelName ? `${st.modelName} · ${st.model}` : (st.model || ''); stopRememberAll = Boolean(st.rememberAll); liveEnabled = st.enabled === true; }
         } catch { /* status fetch is best-effort */ }
       }
