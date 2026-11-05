@@ -154,7 +154,7 @@
     const style = serverColor ? ` style="--connection-color:${serverColor}"` : '';
     return `<svg class="connection-icon ${connected ? 'connected' : 'disconnected'}${attention ? ' attention' : ''}${auto ? ' auto' : ''}${serverColor ? ' has-server-color' : ''}"${style} viewBox="0 0 24 24" role="img" aria-label="${auto ? '自动审批已开启（点击关闭）' : '点击开启自动审批'}"><path class="connection-bolt" d="M13.7 2.5 5.4 13.3h6.2l-1.3 8.2 8.3-11h-6.2l1.3-8Z"/>${connected ? '' : '<path class="connection-slash" d="M4.5 4.5 19.5 19.5"/>'}</svg>`;
   };
-  const CLIENT_BUILD_TAG = 'nexterm-evolution-21-history-scroll-restore';
+  const CLIENT_BUILD_TAG = 'nexterm-evolution-24-codex-running-indicator';
   const notify = (message, type = 'info') => {
     const toast = document.createElement('div'); toast.textContent = message; toast.style.cssText = `position:fixed;right:18px;bottom:18px;z-index:30;background:${type === 'error' ? '#4d2029' : '#17372f'};border:1px solid ${type === 'error' ? '#9d4656' : '#2b8067'};color:#e8fff7;padding:11px 14px;border-radius:9px;font-size:13px;box-shadow:0 10px 30px #0005`;
     document.body.appendChild(toast); setTimeout(() => toast.remove(), 3000);
@@ -836,7 +836,7 @@
   }
   function renderTabs() {
     const tabs = $('#tabs'); if (!tabs) return; stopTabDrag(); const scrollLeft = tabs.scrollLeft;
-    const tabMarkup = [...state.tabs.values()].map((tab) => { const server = state.servers.find((item) => item.id === tab.serverId); return `<div class="tab ${tab.id === state.activeTab ? 'active' : ''}${tab.approvalEnabled ? ' auto-approval' : ''}" data-tab="${tab.id}" title="${escapeHtml(tab.name)}"><button type="button" class="tab-drag-handle${tab.approvalEnabled ? ' auto' : ''}" data-tab-drag data-approval-toggle="${tab.id}" title="${tab.approvalEnabled ? '自动审批已开启，点击关闭（长按可拖动排序）' : '点击开启自动审批（长按可拖动排序）'}" aria-label="长按拖动 ${escapeHtml(tab.name)} 标签排序" aria-pressed="${tab.approvalEnabled ? 'true' : 'false'}">${connectionIcon(tab.connected, tab.needsAttention, server?.color, tab.approvalEnabled)}</button><span class="tab-name">${escapeHtml(tab.name)}</span><button type="button" class="close" data-close="${tab.id}" title="关闭 ${escapeHtml(tab.name)}" aria-label="关闭 ${escapeHtml(tab.name)}">×</button></div>`; }).join('');
+    const tabMarkup = [...state.tabs.values()].map((tab) => { const server = state.servers.find((item) => item.id === tab.serverId); return `<div class="tab ${tab.id === state.activeTab ? 'active' : ''}${tab.approvalEnabled ? ' auto-approval' : ''}${tab.taskWasWorking ? ' working' : ''}" data-tab="${tab.id}" title="${escapeHtml(tab.name)}"><button type="button" class="tab-drag-handle${tab.approvalEnabled ? ' auto' : ''}" data-tab-drag data-approval-toggle="${tab.id}" title="${tab.approvalEnabled ? '自动审批已开启，点击关闭（长按可拖动排序）' : '点击开启自动审批（长按可拖动排序）'}" aria-label="长按拖动 ${escapeHtml(tab.name)} 标签排序" aria-pressed="${tab.approvalEnabled ? 'true' : 'false'}">${connectionIcon(tab.connected, tab.needsAttention, server?.color, tab.approvalEnabled)}</button>${tab.taskWasWorking ? '<span class="tab-working-dot" title="Codex 正在运行" aria-label="Codex 正在运行"></span>' : ''}<span class="tab-name">${escapeHtml(tab.name)}</span><button type="button" class="close" data-close="${tab.id}" title="关闭 ${escapeHtml(tab.name)}" aria-label="关闭 ${escapeHtml(tab.name)}">×</button></div>`; }).join('');
     tabs.innerHTML = tabMarkup; tabs.scrollLeft = scrollLeft;
     tabs.querySelectorAll('[data-tab]').forEach((node) => node.onclick = (event) => {
       if (event.target.closest('[data-close]')) return;
@@ -1043,9 +1043,26 @@
     updateAttentionTitle();
     renderTabs();
   }
-  function updateAttentionTitle() {
-    document.title = state.takenOverTabs.size ? '会话已接力 · NexTerm' : [...state.tabs.values()].some((item) => item.needsAttention) ? '⚡ 需要操作 · NexTerm' : 'NexTerm · Web SSH Workspace';
+  // Mirror the live Codex status of every tab into cheap UI signals:
+  // the tab-strip "working" dot, the browser tab title, and the animated
+  // favicon.  Called on every recognized status transition.
+  function refreshRunningIndicators() {
+    if (typeof renderTabs === 'function') renderTabs();
+    let workingTabs = [];
+    let waitingTabs = [];
+    if (typeof latestCodexStatus === 'function') {
+      for (const item of state.tabs.values()) {
+        if (!item?.connected || !item?.terminal) continue;
+        const status = latestCodexStatus(item);
+        if (status.codexActive && !status.inputRequired) workingTabs.push(item);
+        else if (status.inputRequired) waitingTabs.push(item);
+      }
+    }
+    if (typeof renderRunningFavicon === 'function') renderRunningFavicon(workingTabs.length, waitingTabs.length);
+    const workingName = workingTabs.length === 1 ? ` ${workingTabs[0].name} 工作中` : workingTabs.length > 1 ? ` ${workingTabs.length} 个标签工作中` : '';
+    document.title = state.takenOverTabs.size ? '会话已接力 · NexTerm' : waitingTabs.length ? '⚡ 需要操作 · NexTerm' : workingTabs.length ? `⏳${workingName} · NexTerm` : 'NexTerm · Web SSH Workspace';
   }
+  function updateAttentionTitle() { refreshRunningIndicators(); }
   function clearTabAttention(tab) {
     if (!tab?.needsAttention) return;
     tab.needsAttention = false;
@@ -1160,6 +1177,7 @@
       // A redraw can replace a prompt/finished line with the live Working
       // status.  Clear any attention flag that was set by the older frame.
       clearTabAttention(tab);
+      refreshRunningIndicators();
       return;
     }
     const codexReturnedIdle = tab.taskWasWorking && status.codexIdle;
@@ -1177,6 +1195,7 @@
         if (newCompletion || codexReturnedIdle) requestAnimationFrame(() => { reassertTerminalLiveTail(tab); });
       }
       clearTabAttention(tab);
+      refreshRunningIndicators();
       return;
     }
     if (!inputRequired && !newCompletion && !codexReturnedIdle) return;
@@ -1185,11 +1204,12 @@
       tab.attentionTimer = null;
       if (tab.id === state.activeTab || !tab.connected) return;
       const latestStatus = latestCodexStatus(tab);
-      if (latestStatus.codexActive && !latestStatus.inputRequired) { if (!tab.taskWasWorking) tab.lastCompletionKey = ''; tab.taskWasWorking = true; clearTabAttention(tab); return; }
+      if (latestStatus.codexActive && !latestStatus.inputRequired) { if (!tab.taskWasWorking) tab.lastCompletionKey = ''; tab.taskWasWorking = true; clearTabAttention(tab); refreshRunningIndicators(); return; }
       const latestInputRequired = latestStatus.inputRequired;
       const latestCompleted = latestStatus.codexCompleted && latestStatus.completionKey && latestStatus.completionKey !== tab.lastCompletionKey;
       const latestReturnedIdle = tab.taskWasWorking && latestStatus.codexIdle;
       if (latestInputRequired || latestCompleted || latestReturnedIdle) { if (latestCompleted) tab.lastCompletionKey = latestStatus.completionKey; tab.taskWasWorking = false; markTabAttention(tab, latestInputRequired ? 'input' : 'complete'); }
+      refreshRunningIndicators();
     }, 500);
   }
   function resolveCwdRequests(tab, fallback = '') {
@@ -2362,6 +2382,55 @@ function closeTab(tabId) { const tab = state.tabs.get(tabId); if (!tab) return; 
       else if (tab.id === state.activeTab) { fitTerminal(tab); sendResize(tab); }
     });
   }
+  // Animated favicon: while any Codex session is working the tab icon spins
+  // (a 12-position arc); a prompt waiting for input shows a static amber dot.
+  // A 300ms interval keeps the motion smooth enough for a 16x16 icon without
+  // redrawing every animation frame.
+  function currentRunningCounts() {
+    let working = 0;
+    let waiting = 0;
+    for (const item of state.tabs.values()) {
+      if (!item?.connected || !item?.terminal) continue;
+      const status = latestCodexStatus(item);
+      if (status.codexActive && !status.inputRequired) working += 1;
+      else if (status.inputRequired) waiting += 1;
+    }
+    return { working, waiting };
+  }
+  function paintRunningFavicon(workingCount, waitingCount, phase) {
+    const size = 64;
+    const cx = size / 2; const cy = size / 2; const r = 21;
+    const ring = '<circle cx="32" cy="32" r="21" fill="none" stroke="#243447" stroke-width="7"/>';
+    let arc = '';
+    if (workingCount > 0) {
+      const sweep = workingCount > 1 ? 216 : 132;
+      const step = (360 / 12) * phase;
+      const start = (-90 + step) * Math.PI / 180;
+      const end = (-90 + step + sweep) * Math.PI / 180;
+      const x1 = cx + r * Math.cos(start); const y1 = cy + r * Math.sin(start);
+      const x2 = cx + r * Math.cos(end); const y2 = cy + r * Math.sin(end);
+      arc = `<path d="M ${x1.toFixed(2)} ${y1.toFixed(2)} A ${r} ${r} 0 ${sweep > 180 ? 1 : 0} 1 ${x2.toFixed(2)} ${y2.toFixed(2)}" fill="none" stroke="#66e3b4" stroke-width="7" stroke-linecap="round"/>`;
+    } else if (waitingCount > 0) {
+      arc = '<circle cx="32" cy="32" r="10" fill="#ffd166"/>';
+    }
+    const svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${size} ${size}">${ring}${arc}</svg>`;
+    const url = `data:image/svg+xml,${encodeURIComponent(svg)}`;
+    let link = document.querySelector('link[data-running-favicon]');
+    if (!link) { link = document.createElement('link'); link.rel = 'icon'; link.type = 'image/svg+xml'; link.dataset.runningFavicon = ''; document.head.appendChild(link); }
+    if (link.href !== url) link.href = url;
+  }
+  let faviconPhase = 0;
+  let faviconBusy = false;
+  let faviconIdle = false;
+  function renderRunningFavicon(workingCount, waitingCount) {
+    const busy = workingCount > 0;
+    if (busy === faviconBusy && waitingCount === faviconIdle && !busy) return;
+    faviconBusy = busy; faviconIdle = busy ? 0 : waitingCount;
+    if (busy) paintRunningFavicon(workingCount, 0, faviconPhase);
+    else paintRunningFavicon(0, waitingCount, 0);
+  }
+  setInterval(() => { if (!faviconBusy || document.hidden) return; faviconPhase = (faviconPhase + 1) % 12; const counts = currentRunningCounts(); if (!counts.working) { renderRunningFavicon(0, counts.waiting); return; } paintRunningFavicon(counts.working, 0, faviconPhase); }, 300);
+  paintRunningFavicon(0, 0, 0);
   document.addEventListener('visibilitychange', () => { if (!document.hidden) { updateAttentionTitle(); resumeSessions(); } });
   window.addEventListener('focus', resumeSessions);
   window.addEventListener('online', resumeSessions);
