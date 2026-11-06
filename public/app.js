@@ -154,7 +154,7 @@
     const style = serverColor ? ` style="--connection-color:${serverColor}"` : '';
     return `<svg class="connection-icon ${connected ? 'connected' : 'disconnected'}${attention ? ' attention' : ''}${auto ? ' auto' : ''}${serverColor ? ' has-server-color' : ''}"${style} viewBox="0 0 24 24" role="img" aria-label="${auto ? '自动审批已开启（点击关闭）' : '点击开启自动审批'}"><path class="connection-bolt" d="M13.7 2.5 5.4 13.3h6.2l-1.3 8.2 8.3-11h-6.2l1.3-8Z"/>${connected ? '' : '<path class="connection-slash" d="M4.5 4.5 19.5 19.5"/>'}</svg>`;
   };
-  const CLIENT_BUILD_TAG = 'nexterm-evolution-25-approval-reconnect-tab-fix';
+  const CLIENT_BUILD_TAG = 'nexterm-evolution-26-history-scroll-intent-fix';
   const notify = (message, type = 'info') => {
     const toast = document.createElement('div'); toast.textContent = message; toast.style.cssText = `position:fixed;right:18px;bottom:18px;z-index:30;background:${type === 'error' ? '#4d2029' : '#17372f'};border:1px solid ${type === 'error' ? '#9d4656' : '#2b8067'};color:#e8fff7;padding:11px 14px;border-radius:9px;font-size:13px;box-shadow:0 10px 30px #0005`;
     document.body.appendChild(toast); setTimeout(() => toast.remove(), 3000);
@@ -1139,6 +1139,24 @@
   function terminalUserScrolling(tab) {
     try { return tab?.terminal?._core?._bufferService?.isUserScrolling === true; } catch { return false; }
   }
+  // Safety net for programs (Codex CLI) that redraw most of the screen while
+  // the reader is paging upward: xterm only reports isUserScrolling while the
+  // viewport sits above the live tail, so a full-screen repaint of the visible
+  // region can silently drop that flag and a follow path may snap the view back
+  // down.  A recent explicit wheel/touch scrollback is the stronger signal that
+  // the reader is in control; honor it for a short grace window.
+  const terminalScrollIntents = new WeakMap();
+  function noteTerminalScrollIntent(tab, delta) {
+    if (!tab || !Number.isFinite(Number(delta)) || Number(delta) === 0) return;
+    const intent = terminalScrollIntents.get(tab) || { time:0, up:0, down:0 };
+    intent.time = Date.now();
+    if (Number(delta) < 0) intent.up += 1; else intent.down += 1;
+    terminalScrollIntents.set(tab, intent);
+  }
+  function terminalScrollIntentAway(tab) {
+    const intent = terminalScrollIntents.get(tab);
+    return Boolean(intent) && Date.now() - intent.time < 800 && intent.up > intent.down;
+  }
   function terminalAtBottom(tab) {
     const terminal = tab?.terminal; const buffer = terminal?.buffer?.active;
     if (!buffer) return false;
@@ -1146,9 +1164,9 @@
   }
   function scrollTerminalToBottom(tab, force = false) {
     if (!tab?.terminal || (!force && tab.followOutput === false)) return;
-    if (terminalUserScrolling(tab)) return;
+    if (terminalUserScrolling(tab) || terminalScrollIntentAway(tab)) return;
     tab.terminal.scrollToBottom?.();
-    requestAnimationFrame(() => { if ((force || tab.followOutput !== false) && !terminalUserScrolling(tab)) tab.terminal?.scrollToBottom?.(); });
+    requestAnimationFrame(() => { if ((force || tab.followOutput !== false) && !terminalUserScrolling(tab) && !terminalScrollIntentAway(tab)) tab.terminal?.scrollToBottom?.(); });
   }
   // A live output frame must only pin the viewport to the tail while the
   // reader is still following it.  Force-fitting the bottom on every frame
@@ -1156,7 +1174,7 @@
   // printing, which is why history above the prompt could not be read until
   // the session was re-entered.
   function terminalFollowsLiveTail(tab) {
-    return Boolean(tab?.terminal) && tab.followOutput !== false && !terminalUserScrolling(tab) && terminalAtBottom(tab);
+    return Boolean(tab?.terminal) && tab.followOutput !== false && !terminalUserScrolling(tab) && !terminalScrollIntentAway(tab) && terminalAtBottom(tab);
   }
   function refreshTerminalTail(tab) {
     if (!terminalFollowsLiveTail(tab)) return;
@@ -1170,7 +1188,38 @@
   // while a new prompt is on its way: force the bottom once on the active
   // tab, but never over an in-flight wheel scrollback.
   function reassertTerminalLiveTail(tab) {
-    if (tab.id === state.activeTab && !terminalUserScrolling(tab)) scrollTerminalToBottom(tab, true);
+    if (tab.id !== state.activeTab) return;
+    if (terminalUserScrolling(tab) || terminalScrollIntentAway(tab)) return;
+    // A completion/idle hint repaints most of the screen.  If that repaint
+    // happens while the reader is paging upward, the buffer flag can no longer
+    // tell us who owns the view; only pin the viewport to the tail when it
+    // already sits there, otherwise leave the reader's scroll position alone.
+    scrollTerminalToBottom(tab, terminalAtBottom(tab));
+  }
+  // Observe wheel/touch scrollback on the terminal surface.  We must not
+  // preventDefault here: the active shell owns the wheel (xterm sends SGR mouse
+  // events to the remote program while it has mouse reporting enabled), so we
+  // only listen for the reader's intent and stand down from force-follow for a
+  // short window.  A downward flick or any input re-arms the follow behavior.
+  function watchTerminalScrollIntent(tab) {
+    const target = tab?.view?.querySelector('.terminal');
+    if (!target || target.dataset.scrollIntentWatched === '1') return;
+    target.dataset.scrollIntentWatched = '1';
+    target.addEventListener('wheel', (event) => {
+      const delta = Number(event.deltaY) || Number(event.deltaX) || 0;
+      if (delta < 0) tab.followOutput = true;
+      noteTerminalScrollIntent(tab, delta);
+    }, { passive:true });
+    let touchY = null;
+    target.addEventListener('touchstart', (event) => { touchY = Number(event.touches?.[0]?.clientY); }, { passive:true });
+    target.addEventListener('touchmove', (event) => {
+      const current = Number(event.touches?.[0]?.clientY);
+      if (Number.isFinite(current) && Number.isFinite(touchY) && current !== touchY) {
+        const delta = current - touchY; touchY = current;
+        if (delta > 0) tab.followOutput = true;
+        noteTerminalScrollIntent(tab, delta);
+      }
+    }, { passive:true });
   }
   function terminalViewportText(tab) {
     const terminal = tab?.terminal; const buffer = terminal?.buffer?.active;
@@ -1431,6 +1480,7 @@ function closeTab(tabId) { const tab = state.tabs.get(tabId); if (!tab) return; 
     if (tab.kind === 'vnc') { if (!tab.view || !tab.vnc) createTabView(tab); return connectVncTab(tab, server); }
     if (!tab.view) createTabView(tab);
     watchTerminalSelection(tab);
+    watchTerminalScrollIntent(tab);
     const protocol = location.protocol === 'https:' ? 'wss' : 'ws'; const ws = new WebSocket(`${protocol}://${location.host}/ws`); const generation = ++tab.wsGeneration; tab.ws = ws;
     const isCurrentSocket = () => tab.ws === ws && tab.wsGeneration === generation;
     ws.onopen = () => { if (!isCurrentSocket()) return ws.close(); tab.reconnectAttempt = 0; if (tab.id === state.activeTab) fitTerminal(tab); const dimensions = tab.terminal ? { cols: tab.terminal.cols, rows: tab.terminal.rows } : {}; ws.send(JSON.stringify({ type:'connect', serverId:tab.serverId, sessionId:tab.id, lastSeq:tab.lastSeq, initialCwd:tab.initialCwd || '', tabName:tab.name || '', tabId:tab.id, ...dimensions })); };
@@ -1700,7 +1750,7 @@ function closeTab(tabId) { const tab = state.tabs.get(tabId); if (!tab) return; 
     const server = state.servers.find((item) => item.id === tab.serverId);
     if (tab.kind === 'vnc') return createVncTabView(tab, server);
     const view = document.createElement('div'); view.className = tab.id === state.activeTab ? 'session' : 'session hidden'; view.dataset.sessionId = tab.id; view.innerHTML = `<div class="terminal-wrap"><div class="terminal"></div></div><div class="keybar"><button data-key="\u001b">ESC</button><button data-key="\t">TAB</button><button data-key="\u0003">CTRL+C</button><button data-key="\u0004">CTRL+D</button><button data-key="\u0009">⇥</button><button data-key="\u001b[A">↑</button><button data-key="\u001b[B">↓</button><button data-key="\u001b[D">←</button><button data-key="\u001b[C">→</button></div><div class="session-bar"><span>${escapeHtml(server.host)} · ${escapeHtml(server.username)}</span><span class="approval-badge hidden" role="button" tabindex="0" data-approval-history title="点击查看自动审批记录" aria-label="查看自动审批记录"></span><button class="approval-history-link hidden" data-approval-history title="查看自动审批记录（点击展开）" aria-label="查看自动审批记录">记录</button><span class="grow"></span><button class="ghost-btn session-action" data-sftp title="打开 SFTP 文件管理">${ICONS.sftp}<span>SFTP</span></button><button class="ghost-btn session-action" data-reconnect title="重新连接 SSH 会话">${ICONS.reconnect}<span>重新连接</span></button></div><div class="sftp-panel hidden"><div class="sftp-toolbar"><button class="ghost-btn" data-up>←</button><input class="path-input" value="/" /><button class="ghost-btn" data-refresh>刷新</button><button class="ghost-btn" data-mkdir>新建目录</button><label class="ghost-btn" style="cursor:pointer">上传<input type="file" data-upload multiple hidden /></label><label class="ghost-btn" style="cursor:pointer">上传文件夹<input type="file" data-upload-directory webkitdirectory directory multiple hidden /></label><button class="ghost-btn" type="button" data-sftp-close title="关闭文件面板">关闭</button></div><div class="upload-status hidden" data-upload-status role="status" aria-live="polite"><div class="upload-meta"><span data-upload-label>准备上传</span><span class="upload-percent" data-upload-percent>0%</span><button class="secondary danger" type="button" data-upload-cancel>取消上传</button></div><progress data-upload-progress max="100" value="0"></progress><div class="upload-detail" data-upload-detail></div></div><div class="file-list"><div class="file-row head"><span>名称</span><span>大小</span><span>修改时间</span><span></span></div><div data-files></div></div></div>`;
-    $('#content').appendChild(view); tab.view = view; const terminalElement = $('.terminal', view); tab.terminal = window.Terminal ? new window.Terminal({ cursorBlink:true, scrollback:10000, fontSize:Math.max(11, Math.min(24, Number(state.user?.preferences?.terminalFontSize) || 13)), fontFamily:'"SFMono-Regular",Consolas,"Liberation Mono","Noto Sans Mono CJK SC",monospace', rescaleOverlappingGlyphs:true, rightClickSelectsWord:false, theme:{ background:'#0b1119', foreground:'#d8e4f0', cursor:'#66e3b4', selectionBackground:'#27536a' }, convertEol:true }) : null; if (tab.terminal) { tab.fit = window.FitAddon ? new window.FitAddon.FitAddon() : null; tab.fit && tab.terminal.loadAddon(tab.fit); tab.terminal.open(terminalElement); tab.terminal.attachCustomKeyEventHandler((event) => { if (event.type !== 'keydown') return true; const key = String(event.key || '').toLowerCase(); const modifier = event.ctrlKey || event.metaKey; const plainCopy = (event.ctrlKey && event.shiftKey || event.metaKey && !event.ctrlKey) && key === 'c'; const copySelection = modifier && key === 'c' && !event.shiftKey && !event.altKey && !!String(tab.terminal?.getSelection?.() || ''); if (plainCopy || copySelection) { event.preventDefault(); event.stopPropagation(); void copyTerminalSelection(tab); return false; } if (modifier && key === 'v' && !event.altKey) { event.preventDefault(); event.stopPropagation(); void (async () => { let clipboardText = ''; try { if (navigator.clipboard?.readText) clipboardText = await navigator.clipboard.readText(); } catch { clipboardText = ''; } if (!clipboardText) { notify('无法读取剪贴板，请使用鼠标右键粘贴', 'error'); return; } if (hasMultipleLines(clipboardText) && !(await confirmMultilinePaste(clipboardText))) return; pasteIntoTerminal(tab, clipboardText); })(); return false; } return true; }); if (tab.id === state.activeTab) requestAnimationFrame(() => requestAnimationFrame(() => { if (!view.classList.contains('hidden')) { fitTerminal(tab); sendResize(tab); scrollTerminalToBottom(tab, true); } })); tab.terminal.onData((data) => { if (tab.restoring) return; tab.followOutput = true; if (tab.ws?.readyState === WebSocket.OPEN) tab.ws.send(JSON.stringify({ type:'input', data:btoa(unescape(encodeURIComponent(data))) })); if (!terminalAtBottom(tab)) requestAnimationFrame(() => { if (tab.followOutput !== false && !terminalUserScrolling(tab)) { tab.terminal?.scrollToBottom?.(); tab.terminal?.refresh(0, Math.max(0, tab.terminal.rows - 1)); } }); });
+    $('#content').appendChild(view); tab.view = view; const terminalElement = $('.terminal', view); tab.terminal = window.Terminal ? new window.Terminal({ cursorBlink:true, scrollback:10000, fontSize:Math.max(11, Math.min(24, Number(state.user?.preferences?.terminalFontSize) || 13)), fontFamily:'"SFMono-Regular",Consolas,"Liberation Mono","Noto Sans Mono CJK SC",monospace', rescaleOverlappingGlyphs:true, rightClickSelectsWord:false, theme:{ background:'#0b1119', foreground:'#d8e4f0', cursor:'#66e3b4', selectionBackground:'#27536a' }, convertEol:true }) : null; if (tab.terminal) { tab.fit = window.FitAddon ? new window.FitAddon.FitAddon() : null; tab.fit && tab.terminal.loadAddon(tab.fit); tab.terminal.open(terminalElement); tab.terminal.attachCustomKeyEventHandler((event) => { watchTerminalScrollIntent(tab); if (event.type !== 'keydown') return true; const key = String(event.key || '').toLowerCase(); const modifier = event.ctrlKey || event.metaKey; const plainCopy = (event.ctrlKey && event.shiftKey || event.metaKey && !event.ctrlKey) && key === 'c'; const copySelection = modifier && key === 'c' && !event.shiftKey && !event.altKey && !!String(tab.terminal?.getSelection?.() || ''); if (plainCopy || copySelection) { event.preventDefault(); event.stopPropagation(); void copyTerminalSelection(tab); return false; } if (modifier && key === 'v' && !event.altKey) { event.preventDefault(); event.stopPropagation(); void (async () => { let clipboardText = ''; try { if (navigator.clipboard?.readText) clipboardText = await navigator.clipboard.readText(); } catch { clipboardText = ''; } if (!clipboardText) { notify('无法读取剪贴板，请使用鼠标右键粘贴', 'error'); return; } if (hasMultipleLines(clipboardText) && !(await confirmMultilinePaste(clipboardText))) return; pasteIntoTerminal(tab, clipboardText); })(); return false; } return true; }); if (tab.id === state.activeTab) requestAnimationFrame(() => requestAnimationFrame(() => { if (!view.classList.contains('hidden')) { fitTerminal(tab); sendResize(tab); scrollTerminalToBottom(tab, true); } })); tab.terminal.onData((data) => { if (tab.restoring) return; tab.followOutput = true; if (tab.ws?.readyState === WebSocket.OPEN) tab.ws.send(JSON.stringify({ type:'input', data:btoa(unescape(encodeURIComponent(data))) })); if (!terminalAtBottom(tab)) requestAnimationFrame(() => { if (tab.followOutput !== false && !terminalUserScrolling(tab)) { tab.terminal?.scrollToBottom?.(); tab.terminal?.refresh(0, Math.max(0, tab.terminal.rows - 1)); } }); });
       // Scrolling the scrollback has to win against the live tail, otherwise the
       // view snaps back down on the next output chunk and upward wheel/touch
       // motion looks completely dead.  That fight is decided here:
