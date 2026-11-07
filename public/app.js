@@ -154,7 +154,7 @@
     const style = serverColor ? ` style="--connection-color:${serverColor}"` : '';
     return `<svg class="connection-icon ${connected ? 'connected' : 'disconnected'}${attention ? ' attention' : ''}${auto ? ' auto' : ''}${serverColor ? ' has-server-color' : ''}"${style} viewBox="0 0 24 24" role="img" aria-label="${auto ? '自动审批已开启（点击关闭）' : '点击开启自动审批'}"><path class="connection-bolt" d="M13.7 2.5 5.4 13.3h6.2l-1.3 8.2 8.3-11h-6.2l1.3-8Z"/>${connected ? '' : '<path class="connection-slash" d="M4.5 4.5 19.5 19.5"/>'}</svg>`;
   };
-  const CLIENT_BUILD_TAG = 'nexterm-evolution-26-history-scroll-intent-fix';
+  const CLIENT_BUILD_TAG = 'nexterm-evolution-27-history-local-scroll-fix';
   const notify = (message, type = 'info') => {
     const toast = document.createElement('div'); toast.textContent = message; toast.style.cssText = `position:fixed;right:18px;bottom:18px;z-index:30;background:${type === 'error' ? '#4d2029' : '#17372f'};border:1px solid ${type === 'error' ? '#9d4656' : '#2b8067'};color:#e8fff7;padding:11px 14px;border-radius:9px;font-size:13px;box-shadow:0 10px 30px #0005`;
     document.body.appendChild(toast); setTimeout(() => toast.remove(), 3000);
@@ -1162,6 +1162,11 @@
     if (!buffer) return false;
     return Number(buffer.viewportY) >= Number(buffer.baseY) + Number(terminal.rows || 0) - 1;
   }
+  function terminalScrollbackAvailable(tab) {
+    const buffer = tab?.terminal?.buffer?.active;
+    if (!buffer || buffer.type === 'alternate' || buffer.hasScrollback === false) return false;
+    return Number(buffer.baseY || 0) > 0;
+  }
   function scrollTerminalToBottom(tab, force = false) {
     if (!tab?.terminal || (!force && tab.followOutput === false)) return;
     if (terminalUserScrolling(tab) || terminalScrollIntentAway(tab)) return;
@@ -1207,7 +1212,6 @@
     target.dataset.scrollIntentWatched = '1';
     target.addEventListener('wheel', (event) => {
       const delta = Number(event.deltaY) || Number(event.deltaX) || 0;
-      if (delta < 0) tab.followOutput = true;
       noteTerminalScrollIntent(tab, delta);
     }, { passive:true });
     let touchY = null;
@@ -1216,7 +1220,6 @@
       const current = Number(event.touches?.[0]?.clientY);
       if (Number.isFinite(current) && Number.isFinite(touchY) && current !== touchY) {
         const delta = current - touchY; touchY = current;
-        if (delta > 0) tab.followOutput = true;
         noteTerminalScrollIntent(tab, delta);
       }
     }, { passive:true });
@@ -1776,6 +1779,32 @@ function closeTab(tabId) { const tab = state.tabs.get(tabId); if (!tab) return; 
         if (!buffer) return 0;
         return Math.max(0, Number(buffer.ybase) - Number(buffer.viewportY));
       };
+      const scrollRowHeight = () => {
+        const rendered = Number(tab.terminal?._core?._renderService?.dimensions?.css?.cell?.height);
+        if (Number.isFinite(rendered) && rendered > 0) return rendered;
+        const rows = Math.max(1, Number(tab.terminal?.rows || 1));
+        const height = Number(terminalElement.clientHeight || 0);
+        return height > 0 ? Math.max(1, height / rows) : 16;
+      };
+      const scrollHistoryByPixels = (pixels) => {
+        const rowHeight = scrollRowHeight();
+        scrollState.wheelRemainder = (scrollState.wheelRemainder || 0) + Number(pixels || 0);
+        let lines = Math.trunc(scrollState.wheelRemainder / rowHeight);
+        if (!lines) return 0;
+        scrollState.wheelRemainder -= lines * rowHeight;
+        const page = Math.max(1, Number(tab.terminal?.rows || 1));
+        lines = Math.max(-page, Math.min(page, lines));
+        tab.terminal?.scrollLines?.(lines);
+        tab.followOutput = terminalAtBottom(tab);
+        return lines;
+      };
+      const wheelPixels = (event) => {
+        let pixels = Number(event.deltaY) || 0;
+        if (event.deltaMode === 1) pixels *= scrollRowHeight();
+        else if (event.deltaMode === 2) pixels *= scrollRowHeight() * Math.max(1, Number(tab.terminal?.rows || 1));
+        return pixels;
+      };
+      const useLocalHistoryScroll = () => terminalUsesMouseReporting(tab) && terminalScrollbackAvailable(tab);
       const scheduleMomentum = () => {
         if (scrollState.momentumFrame) return;
         scrollState.momentumFrame = requestAnimationFrame(() => {
@@ -1806,7 +1835,18 @@ function closeTab(tabId) { const tab = state.tabs.get(tabId); if (!tab) return; 
         // back to the live tail.
         viewport.addEventListener('scroll', syncTerminalFollowFromViewport, { passive:true });
         terminalElement.addEventListener('wheel', (event) => {
-          if (!event.deltaY) return;
+          if (!event.deltaY || event.ctrlKey) return;
+          // Codex keeps mouse reporting enabled in its idle prompt. xterm then
+          // forwards the wheel to the TUI instead of scrolling its own buffer,
+          // so finished output cannot be read until Codex exits. When the
+          // normal screen already has scrollback, the local history wins.
+          if (useLocalHistoryScroll()) {
+            event.preventDefault();
+            event.stopImmediatePropagation();
+            noteTerminalScrollIntent(tab, event.deltaY);
+            scrollHistoryByPixels(wheelPixels(event));
+            return;
+          }
           // Scrolling back down to the live tail re-arms follow; anything else is
           // the reader taking control. macOS momentum keeps firing after the
           // gesture ends, so follow must not be re-derived from delta signs.
@@ -1824,6 +1864,32 @@ function closeTab(tabId) { const tab = state.tabs.get(tabId); if (!tab) return; 
           }
         }, { capture:true, passive:false });
       };
+      if (!terminalElement._nextermHistoryTouchWired) {
+        terminalElement._nextermHistoryTouchWired = true;
+        let touchX = 0; let touchY = 0; let touching = false;
+        terminalElement.addEventListener('touchstart', (event) => {
+          const touch = event.touches?.[0];
+          touching = Boolean(touch);
+          if (!touch) return;
+          touchX = Number(touch.clientX) || 0; touchY = Number(touch.clientY) || 0;
+        }, { capture:true, passive:true });
+        terminalElement.addEventListener('touchmove', (event) => {
+          if (!useLocalHistoryScroll()) return;
+          const touch = event.touches?.[0];
+          if (!touch) return;
+          const x = Number(touch.clientX) || 0; const y = Number(touch.clientY) || 0;
+          if (!touching) { touching = true; touchX = x; touchY = y; return; }
+          const dx = x - touchX; const dy = y - touchY; touchX = x; touchY = y;
+          if (Math.abs(dy) <= Math.abs(dx) || Math.abs(dy) < 2) return;
+          event.preventDefault();
+          event.stopImmediatePropagation();
+          noteTerminalScrollIntent(tab, -dy);
+          scrollHistoryByPixels(-dy);
+        }, { capture:true, passive:false });
+        const endTouch = () => { touching = false; };
+        terminalElement.addEventListener('touchend', endTouch, { capture:true, passive:true });
+        terminalElement.addEventListener('touchcancel', endTouch, { capture:true, passive:true });
+      }
       attachViewportFollow();
       tab.terminal.onScroll(() => { attachViewportFollow(); syncTerminalFollowFromViewport(); });
       new MutationObserver(attachViewportFollow).observe(terminalElement, { childList:true, subtree:true });
