@@ -1034,7 +1034,13 @@
     if (action === 'state') {
       tab.approvalStateSynced = true;
       tab.approvalEnabled = message.enabled === true;
-      tab.approvalModelId = message.modelId || tab.approvalModelId;
+      if (message.modelId) tab.approvalModelId = message.modelId;
+      else if (message.enabled === true) {
+        // No explicit model recorded: track the server's effective model so a
+        // default-model change in settings follows this tab live.
+        const effective = defaultApprovalModelId();
+        if (effective) tab.approvalModelId = effective;
+      }
       tab.approvalRememberAll = Boolean(message.rememberAll);
       if (tab.approvalEnabled) { tab.approvalStopReason = ''; tab.approvalStopReasonMessage = ''; }
       else if (message.reason && message.reason !== 'client-disabled') { tab.approvalStopReason = message.reason; tab.approvalStopReasonMessage = message.message || ''; }
@@ -2192,6 +2198,7 @@ function closeTab(tabId) { const tab = state.tabs.get(tabId); if (!tab) return; 
           models = result.models || models;
           const now = state.user.preferences.approvalDefaultModelId || '';
           const changed = now !== was;
+          if (changed) applyDefaultToOpenTabs(now);
           await setApprovalDefault(id, true);
           if (!changed) {
             const model = models.find((m) => m.id === now);
@@ -2238,6 +2245,25 @@ function closeTab(tabId) { const tab = state.tabs.get(tabId); if (!tab) return; 
           delete button.dataset.busy;
           if (button.isConnected) syncDefaultMarks(state.user?.preferences?.approvalDefaultModelId || '');
         }
+      };
+      // Push the new default into every already-open SSH terminal so the
+      // switch takes effect immediately without reopening the tab.
+      const applyDefaultToOpenTabs = (id) => {
+        state.tabs.forEach((tab) => {
+          if (tab.kind !== 'ssh' || !tab.approvalEnabled) return;
+          if (id) {
+            tab.approvalModelId = id;
+            if (sendApprovalControl(tab, 'enable', { modelId:id })) {
+              setTabApprovalStatus(tab, `已切换 · ${approvalModelLabel(id)}`, 'info', 4000);
+            }
+          } else {
+            // Restore auto-selection: clear the explicit model and let the
+            // server resolve the effective default; the state event syncs back.
+            tab.approvalModelId = '';
+            sendApprovalControl(tab, 'enable');
+          }
+        });
+        persistSessions();
       };
       list.onclick = async (event) => {
         const defaultButton = event.target.closest('[data-default]');

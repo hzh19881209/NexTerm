@@ -1812,6 +1812,20 @@ const APPROVAL_STOP_REASONS = {
 function approvalStopReasonLabel(reason) {
   return APPROVAL_STOP_REASONS[reason] || '自动审批已停止，已交回人工处理。';
 }
+// The effective model for a session: the explicitly chosen one, falling back
+// to the user's current default so preference changes apply to already-open
+// terminals immediately (per-evaluation resolution, no re-connection needed).
+function resolveSessionApprovalModel(session, explicitModelId = '') {
+  const account = users.find((item) => item.id === session.ownerId) || {};
+  if (explicitModelId) {
+    const model = findApprovalModel(account, explicitModelId);
+    if (model) return model;
+  }
+  return findApprovalModel(account, session.approval?.modelId)
+    || findApprovalModel(account, String(account.preferences?.approvalDefaultModelId || ''))
+    || approvalModels(account).find((item) => item.enabled !== false)
+    || null;
+}
 function stopSessionApproval(session, reason = 'stopped') {
   if (!session) return;
   session.approvalGeneration = Number(session.approvalGeneration || 0) + 1;
@@ -1834,11 +1848,11 @@ function stopSessionApproval(session, reason = 'stopped') {
 }
 function approvalStateMessage(session, requestId = '') {
   const account = users.find((item) => item.id === session.ownerId) || {};
-  const model = findApprovalModel(account, String(session.approval?.modelId || '')) || null;
+  const model = resolveSessionApprovalModel(session);
   const stopReason = String(session.approvalStopReason || '');
   const message = {
     type:'approval', action:'state', enabled:Boolean(session.approval?.enabled),
-    modelId:String(session.approval?.modelId || ''),
+    modelId:model?.id || '',
     modelName:model ? approvalMaskSecrets(model.name) : '',
     model:model ? approvalMaskSecrets(model.model) : '',
     rememberAll:Boolean(session.approval?.rememberAll), stopReason,
@@ -1870,8 +1884,7 @@ async function evaluateSessionApproval(session) {
 
   const account = users.find((item) => item.id === session.ownerId);
   if (!account) return stopSessionApproval(session, 'account-missing');
-  const modelId = session.approval.modelId || account.preferences?.approvalDefaultModelId || '';
-  const model = findApprovalModel(account, modelId) || approvalModels(account).find((item) => item.enabled !== false) || null;
+  const model = resolveSessionApprovalModel(session);
   if (!model) {
     approvalSend(session, { action:'need_human', reason:'no_model', message:'未配置可用的审批模型，已交回人工处理' });
     return stopSessionApproval(session, 'no-model');
@@ -1975,7 +1988,7 @@ async function evaluateSessionApproval(session) {
 function startSessionApproval(session, modelId) {
   const account = users.find((item) => item.id === session.ownerId);
   if (!account) return { error:'账户不存在' };
-  const model = findApprovalModel(account, String(modelId || '')) || approvalModels(account).find((item) => item.enabled !== false) || null;
+  const model = resolveSessionApprovalModel(session, String(modelId || ''));
   if (!model) return { error:'请先在设置中添加审批模型' };
   // Reconnects (including browser refreshes) re-send "enable". Treat an
   // already-running identical configuration as a state query, not a reset:
