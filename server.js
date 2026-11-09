@@ -386,7 +386,7 @@ function publicApprovalModel(model) {
   return {
     id: model.id,
     name: approvalMaskSecrets(model.name),
-    baseUrl: String(model.baseUrl || ''),
+    baseUrl: normalizeApprovalText(model.baseUrl).trim(),
     model: approvalMaskSecrets(model.model),
     hasKey: Boolean(plaintext),
     keyHint: plaintext ? `••••${plaintext.slice(-4)}` : '',
@@ -417,6 +417,33 @@ function cleanApprovalModelInput(body, old = {}) {
 }
 function findApprovalModel(user, modelId) {
   return approvalModels(user).find((item) => item.id === modelId) || null;
+}
+// Older records may still contain percent-encoded values from pasted URLs or
+// model IDs. Normalize them once at startup so both the UI and upstream calls
+// see the real value, not only newly saved models.
+function normalizeStoredApprovalModel(model) {
+  if (!model || typeof model !== 'object') return false;
+  let changed = false;
+  for (const field of ['name', 'model']) {
+    const normalized = normalizeApprovalText(model[field]).trim();
+    if (normalized && normalized !== model[field]) { model[field] = normalized; changed = true; }
+  }
+  const rawBaseUrl = String(model.baseUrl || '');
+  try {
+    const normalizedBaseUrl = approvalBaseUrl(normalizeApprovalText(rawBaseUrl).trim());
+    if (normalizedBaseUrl !== rawBaseUrl) { model.baseUrl = normalizedBaseUrl; changed = true; }
+  } catch { /* Keep malformed legacy URLs visible so the user can correct them. */ }
+  return changed;
+}
+{
+  let migratedApprovalModels = false;
+  for (const user of users) {
+    if (!Array.isArray(user?.approvalModels)) continue;
+    for (const model of user.approvalModels) {
+      if (normalizeStoredApprovalModel(model)) migratedApprovalModels = true;
+    }
+  }
+  if (migratedApprovalModels) writeJson(usersFile, users);
 }
 // --- AI approval assistant: upstream chat call -------------------------------
 function approvalHttpRequest(endpoint, apiKey, payload, timeoutMs, stream = false) {

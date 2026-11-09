@@ -2126,7 +2126,7 @@ function closeTab(tabId) { const tab = state.tabs.get(tabId); if (!tab) return; 
   function openApprovalSettings() {
     console.info('[NexTerm] build', CLIENT_BUILD_TAG);
     void (async () => {
-      const models = await refreshApprovalModels();
+      let models = await refreshApprovalModels();
       const backdrop = document.createElement('div'); backdrop.className = 'modal-backdrop';
       backdrop.innerHTML = `<div class="modal approval-modal"><div class="modal-head"><h3>自动审批模型</h3><button type="button" class="icon-btn" data-close aria-label="关闭">×</button></div><div class="modal-body"><p class="settings-note">终端里出现 Codex 等 CLI 的确认提示时，由这里配置的大模型判断该按 1、2 还是 3。兼容 OpenAI Chat Completions 协议的服务都可以用，例如 TokenMeter 网关、LM Studio、Ollama、vLLM、OpenAI。密钥只保存在服务端并加密，不会下发到浏览器。</p><div class="approval-default" data-approval-default></div><div class="approval-list" data-approval-list></div><div class="approval-editor" data-approval-editor></div></div><div class="modal-actions"><button type="button" class="secondary" data-close>关闭</button><button type="button" class="primary" data-add>添加模型</button></div></div>`;
       document.body.appendChild(backdrop);
@@ -2217,7 +2217,8 @@ function closeTab(tabId) { const tab = state.tabs.get(tabId); if (!tab) return; 
           const editing = editor.dataset.editing;
           try {
             const result = await api(editing ? `/api/approval-models/${editing}` : '/api/approval-models', { method: editing ? 'PUT' : 'POST', body });
-            state.user.approvalModels = result.models || [];
+            models = result.models || [];
+            state.user.approvalModels = models;
             closeEditor(); renderList(); notify(editing ? '审批模型已更新' : '审批模型已添加');
           } catch (e) { error.textContent = e.message; }
         };
