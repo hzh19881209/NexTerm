@@ -95,6 +95,23 @@ const EVOLUTION_KINDS = new Set(['suggestion', 'bug']);
 const EVOLUTION_WRITE_WINDOW_MS = 60_000;
 const EVOLUTION_WRITES_PER_WINDOW = 6;
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 100 * 1024 * 1024 } });
+const PASTE_IMAGE_LIMIT_BYTES = 20 * 1024 * 1024;
+const pasteImageUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: PASTE_IMAGE_LIMIT_BYTES, files: 1 } });
+function pasteImageMiddleware(req, res, next) {
+  pasteImageUpload.single('image')(req, res, (error) => {
+    if (!error) return next();
+    if (error.code === 'LIMIT_FILE_SIZE') return res.status(413).json({ error: '剪贴板图片不能超过 20 MB' });
+    res.status(400).json({ error: '剪贴板图片上传失败' });
+  });
+}
+function pastedImageExtension(buffer) {
+  if (!Buffer.isBuffer(buffer) || !buffer.length) return '';
+  if (buffer.length >= 8 && buffer.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))) return 'png';
+  if (buffer.length >= 3 && buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[2] === 0xff) return 'jpg';
+  if (buffer.length >= 12 && buffer.toString('ascii', 0, 4) === 'RIFF' && buffer.toString('ascii', 8, 12) === 'WEBP') return 'webp';
+  if (buffer.length >= 6 && ['GIF87a', 'GIF89a'].includes(buffer.toString('ascii', 0, 6))) return 'gif';
+  return '';
+}
 
 if (APP_SECRET.length < 32 || KNOWN_INSECURE_APP_SECRETS.has(APP_SECRET.trim())) {
   console.error('APP_SECRET must be a non-default value with at least 32 characters.');
@@ -1539,6 +1556,25 @@ app.post('/api/servers/:id/files/upload', auth, csrf, passwordChanged, upload.si
     auditEvent('sftp.upload', req, req.account, '已上传远程文件', { serverId:server.id, path:remote, size:req.file.size }); res.json({ ok: true, name: req.file.originalname, relativePath });
   }
   catch (error) { res.status(400).json({ error: error.message || '上传失败' }); }
+});
+// The browser can read clipboard images, but the Codex CLI runs on the remote
+// host and can only read files there. Store the image over SFTP and return its
+// path so the client can paste it as text; Codex turns pasted image paths into
+// image attachments automatically.
+app.post('/api/servers/:id/paste-image', auth, csrf, passwordChanged, pasteImageMiddleware, async (req, res) => {
+  const server = serverOr404(req, res); if (!server) return;
+  if (!req.file?.buffer?.length) return res.status(400).json({ error: '剪贴板中没有图片' });
+  if (windowsSftpEnabled(server)) return res.status(400).json({ error: 'Windows SFTP 暂不支持终端图片粘贴' });
+  const extension = pastedImageExtension(req.file.buffer);
+  if (!extension) return res.status(400).json({ error: '仅支持 PNG、JPEG、WebP 或 GIF 图片' });
+  const remote = `/tmp/nexterm-paste-${Date.now()}-${crypto.randomBytes(6).toString('hex')}.${extension}`;
+  try {
+    await withSftp(server, (sftp) => sftp.put(req.file.buffer, remote));
+    auditEvent('terminal.paste_image', req, req.account, '已将剪贴板图片上传到远程终端', { serverId:server.id, path:remote, size:req.file.size, format:extension });
+    res.json({ ok: true, path: remote });
+  } catch (error) {
+    res.status(502).json({ error: `图片上传到远端失败：${error.message || 'SFTP 不可用'}` });
+  }
 });
 app.get('/api/servers/:id/files/download', auth, passwordChanged, async (req, res) => {
   const server = serverOr404(req, res); if (!server) return;

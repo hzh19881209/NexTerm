@@ -154,7 +154,7 @@
     const style = serverColor ? ` style="--connection-color:${serverColor}"` : '';
     return `<svg class="connection-icon ${connected ? 'connected' : 'disconnected'}${attention ? ' attention' : ''}${auto ? ' auto' : ''}${serverColor ? ' has-server-color' : ''}"${style} viewBox="0 0 24 24" role="img" aria-label="${auto ? '自动审批已开启（点击关闭）' : '点击开启自动审批'}"><path class="connection-bolt" d="M13.7 2.5 5.4 13.3h6.2l-1.3 8.2 8.3-11h-6.2l1.3-8Z"/>${connected ? '' : '<path class="connection-slash" d="M4.5 4.5 19.5 19.5"/>'}</svg>`;
   };
-  const CLIENT_BUILD_TAG = 'nexterm-evolution-27-history-local-scroll-fix';
+  const CLIENT_BUILD_TAG = 'nexterm-evolution-30-clipboard-image-paste';
   const notify = (message, type = 'info') => {
     const toast = document.createElement('div'); toast.textContent = message; toast.style.cssText = `position:fixed;right:18px;bottom:18px;z-index:30;background:${type === 'error' ? '#4d2029' : '#17372f'};border:1px solid ${type === 'error' ? '#9d4656' : '#2b8067'};color:#e8fff7;padding:11px 14px;border-radius:9px;font-size:13px;box-shadow:0 10px 30px #0005`;
     document.body.appendChild(toast); setTimeout(() => toast.remove(), 3000);
@@ -204,6 +204,72 @@
       return;
     }
     if (tab.ws?.readyState === WebSocket.OPEN) tab.ws.send(JSON.stringify({ type:'input', data:btoa(unescape(encodeURIComponent(value))) }));
+  }
+  const CLIPBOARD_IMAGE_LIMIT = 20 * 1024 * 1024;
+  const CLIPBOARD_IMAGE_TYPE = /^image\/(png|jpeg|webp|gif)$/i;
+  function clipboardImageExtension(image) {
+    const type = String(image?.type || '').toLowerCase();
+    if (type === 'image/jpeg') return 'jpg';
+    if (type === 'image/webp') return 'webp';
+    if (type === 'image/gif') return 'gif';
+    return 'png';
+  }
+  async function readClipboardContent() {
+    let image = null;
+    let text = '';
+    let error = null;
+    if (typeof navigator.clipboard?.read === 'function') {
+      try {
+        const items = await navigator.clipboard.read();
+        for (const item of items) {
+          const imageType = item.types.find((type) => CLIPBOARD_IMAGE_TYPE.test(type));
+          if (imageType) { image = await item.getType(imageType); break; }
+        }
+        if (!image) {
+          for (const item of items) {
+            if (!item.types.includes('text/plain')) continue;
+            text = await (await item.getType('text/plain')).text();
+            break;
+          }
+        }
+      } catch (readError) { error = readError; }
+    }
+    if (!image && !text && typeof navigator.clipboard?.readText === 'function') {
+      try { text = await navigator.clipboard.readText(); } catch (readError) { error = error || readError; }
+    }
+    return { image, text, error };
+  }
+  async function pasteClipboardImage(tab, image) {
+    if (tab.restoring || tab.imagePastePending) return;
+    if (!(image instanceof Blob) || !image.size) { notify('剪贴板图片为空', 'error'); return; }
+    if (image.size > CLIPBOARD_IMAGE_LIMIT) { notify('剪贴板图片不能超过 20 MB', 'error'); return; }
+    if (tab.ws?.readyState !== WebSocket.OPEN) { notify('终端未连接，无法粘贴图片', 'error'); return; }
+    tab.imagePastePending = true;
+    notify('正在上传剪贴板图片…');
+    try {
+      const form = new FormData();
+      form.append('image', image, `clipboard.${clipboardImageExtension(image)}`);
+      const result = await api(`/api/servers/${encodeURIComponent(tab.serverId)}/paste-image`, { method:'POST', body:form });
+      if (!result?.path) throw new Error('服务器未返回图片路径');
+      if (!state.tabs.has(tab.id)) return;
+      // Codex treats a pasted path to an image file as an image attachment.
+      pasteIntoTerminal(tab, String(result.path));
+      notify('剪贴板图片已发送到终端');
+    } catch (error) {
+      notify(`图片粘贴失败：${error.message || '上传失败'}`, 'error');
+    } finally {
+      tab.imagePastePending = false;
+    }
+  }
+  async function pasteClipboardToTerminal(tab) {
+    const clipboard = await readClipboardContent();
+    if (clipboard.image) { await pasteClipboardImage(tab, clipboard.image); return; }
+    if (!clipboard.text) {
+      notify(clipboard.error ? '无法读取剪贴板，请检查浏览器的剪贴板权限' : '剪贴板为空或没有可粘贴的图片/文本', 'error');
+      return;
+    }
+    if (hasMultipleLines(clipboard.text) && !(await confirmMultilinePaste(clipboard.text))) return;
+    pasteIntoTerminal(tab, clipboard.text);
   }
   function copyText(value, message = '已复制') {
     const text = String(value);
@@ -351,17 +417,7 @@
     // A recent drag inside the terminal therefore asks the TUI to copy; Codex
     // returns that text through OSC 52, which watchTerminalSelection handles.
     if (hasTerminalSelectionGesture(tab)) { requestTerminalAppCopy(tab); return; }
-    if (typeof navigator.clipboard?.readText !== 'function') { notify('无法粘贴：当前浏览器不允许程序读取剪贴板', 'error'); return; }
-    let clipboardText = '';
-    try {
-      clipboardText = await navigator.clipboard.readText();
-    } catch {
-      notify('浏览器拒绝读取剪贴板，请使用 Ctrl/Cmd+V 粘贴', 'error');
-      return;
-    }
-    if (!clipboardText) { notify('剪贴板为空'); return; }
-    if (hasMultipleLines(clipboardText) && !(await confirmMultilinePaste(clipboardText))) return;
-    pasteIntoTerminal(tab, clipboardText);
+    await pasteClipboardToTerminal(tab);
   }
   // Shared SFTP panel markup + wiring so SSH and Windows(VNC) tabs get the
   // exact same file-management UI. The panel talks to /api/servers/:id/files,
@@ -1759,7 +1815,34 @@ function closeTab(tabId) { const tab = state.tabs.get(tabId); if (!tab) return; 
     const server = state.servers.find((item) => item.id === tab.serverId);
     if (tab.kind === 'vnc') return createVncTabView(tab, server);
     const view = document.createElement('div'); view.className = tab.id === state.activeTab ? 'session' : 'session hidden'; view.dataset.sessionId = tab.id; view.innerHTML = `<div class="terminal-wrap"><div class="terminal"></div></div><div class="keybar"><button data-key="\u001b">ESC</button><button data-key="\t">TAB</button><button data-key="\u0003">CTRL+C</button><button data-key="\u0004">CTRL+D</button><button data-key="\u0009">⇥</button><button data-key="\u001b[A">↑</button><button data-key="\u001b[B">↓</button><button data-key="\u001b[D">←</button><button data-key="\u001b[C">→</button></div><div class="session-bar"><span>${escapeHtml(server.host)} · ${escapeHtml(server.username)}</span><span class="approval-badge hidden" role="button" tabindex="0" data-approval-history title="点击查看自动审批记录" aria-label="查看自动审批记录"></span><button class="approval-history-link hidden" data-approval-history title="查看自动审批记录（点击展开）" aria-label="查看自动审批记录">记录</button><span class="grow"></span><button class="ghost-btn session-action" data-sftp title="打开 SFTP 文件管理">${ICONS.sftp}<span>SFTP</span></button><button class="ghost-btn session-action" data-reconnect title="重新连接 SSH 会话">${ICONS.reconnect}<span>重新连接</span></button></div><div class="sftp-panel hidden"><div class="sftp-toolbar"><button class="ghost-btn" data-up>←</button><input class="path-input" value="/" /><button class="ghost-btn" data-refresh>刷新</button><button class="ghost-btn" data-mkdir>新建目录</button><label class="ghost-btn" style="cursor:pointer">上传<input type="file" data-upload multiple hidden /></label><label class="ghost-btn" style="cursor:pointer">上传文件夹<input type="file" data-upload-directory webkitdirectory directory multiple hidden /></label><button class="ghost-btn" type="button" data-sftp-close title="关闭文件面板">关闭</button></div><div class="upload-status hidden" data-upload-status role="status" aria-live="polite"><div class="upload-meta"><span data-upload-label>准备上传</span><span class="upload-percent" data-upload-percent>0%</span><button class="secondary danger" type="button" data-upload-cancel>取消上传</button></div><progress data-upload-progress max="100" value="0"></progress><div class="upload-detail" data-upload-detail></div></div><div class="file-list"><div class="file-row head"><span>名称</span><span>大小</span><span>修改时间</span><span></span></div><div data-files></div></div></div>`;
-    $('#content').appendChild(view); tab.view = view; const terminalElement = $('.terminal', view); tab.terminal = window.Terminal ? new window.Terminal({ cursorBlink:true, scrollback:10000, fontSize:Math.max(11, Math.min(24, Number(state.user?.preferences?.terminalFontSize) || 13)), fontFamily:'"SFMono-Regular",Consolas,"Liberation Mono","Noto Sans Mono CJK SC",monospace', rescaleOverlappingGlyphs:true, rightClickSelectsWord:false, theme:{ background:'#0b1119', foreground:'#d8e4f0', cursor:'#66e3b4', selectionBackground:'#27536a' }, convertEol:true }) : null; if (tab.terminal) { tab.fit = window.FitAddon ? new window.FitAddon.FitAddon() : null; tab.fit && tab.terminal.loadAddon(tab.fit); tab.terminal.open(terminalElement); tab.terminal.attachCustomKeyEventHandler((event) => { watchTerminalScrollIntent(tab); if (event.type !== 'keydown') return true; const key = String(event.key || '').toLowerCase(); const modifier = event.ctrlKey || event.metaKey; const plainCopy = (event.ctrlKey && event.shiftKey || event.metaKey && !event.ctrlKey) && key === 'c'; const copySelection = modifier && key === 'c' && !event.shiftKey && !event.altKey && !!String(tab.terminal?.getSelection?.() || ''); if (plainCopy || copySelection) { event.preventDefault(); event.stopPropagation(); void copyTerminalSelection(tab); return false; } if (modifier && key === 'v' && !event.altKey) { event.preventDefault(); event.stopPropagation(); void (async () => { let clipboardText = ''; try { if (navigator.clipboard?.readText) clipboardText = await navigator.clipboard.readText(); } catch { clipboardText = ''; } if (!clipboardText) { notify('无法读取剪贴板，请使用鼠标右键粘贴', 'error'); return; } if (hasMultipleLines(clipboardText) && !(await confirmMultilinePaste(clipboardText))) return; pasteIntoTerminal(tab, clipboardText); })(); return false; } return true; }); if (tab.id === state.activeTab) requestAnimationFrame(() => requestAnimationFrame(() => { if (!view.classList.contains('hidden')) { fitTerminal(tab); sendResize(tab); scrollTerminalToBottom(tab, true); } })); tab.terminal.onData((data) => { if (tab.restoring) return; tab.followOutput = true; if (tab.ws?.readyState === WebSocket.OPEN) tab.ws.send(JSON.stringify({ type:'input', data:btoa(unescape(encodeURIComponent(data))) })); if (!terminalAtBottom(tab)) requestAnimationFrame(() => { if (tab.followOutput !== false && !terminalUserScrolling(tab)) { tab.terminal?.scrollToBottom?.(); tab.terminal?.refresh(0, Math.max(0, tab.terminal.rows - 1)); } }); });
+    $('#content').appendChild(view);
+    tab.view = view;
+    const terminalElement = $('.terminal', view);
+    tab.terminal = window.Terminal ? new window.Terminal({ cursorBlink:true, scrollback:10000, fontSize:Math.max(11, Math.min(24, Number(state.user?.preferences?.terminalFontSize) || 13)), fontFamily:'"SFMono-Regular",Consolas,"Liberation Mono","Noto Sans Mono CJK SC",monospace', rescaleOverlappingGlyphs:true, rightClickSelectsWord:false, theme:{ background:'#0b1119', foreground:'#d8e4f0', cursor:'#66e3b4', selectionBackground:'#27536a' }, convertEol:true }) : null;
+    if (tab.terminal) {
+      tab.fit = window.FitAddon ? new window.FitAddon.FitAddon() : null;
+      tab.fit && tab.terminal.loadAddon(tab.fit);
+      tab.terminal.open(terminalElement);
+      tab.terminal.attachCustomKeyEventHandler((event) => {
+        watchTerminalScrollIntent(tab);
+        if (event.type !== 'keydown') return true;
+        const key = String(event.key || '').toLowerCase();
+        const modifier = event.ctrlKey || event.metaKey;
+        const plainCopy = (event.ctrlKey && event.shiftKey || event.metaKey && !event.ctrlKey) && key === 'c';
+        const copySelection = modifier && key === 'c' && !event.shiftKey && !event.altKey && !!String(tab.terminal?.getSelection?.() || '');
+        if (plainCopy || copySelection) { event.preventDefault(); event.stopPropagation(); void copyTerminalSelection(tab); return false; }
+        if (modifier && key === 'v' && !event.altKey) {
+          // Without async clipboard image support, let the native paste event inspect the clipboard data.
+          if (typeof navigator.clipboard?.read !== 'function') return true;
+          event.preventDefault();
+          event.stopPropagation();
+          void pasteClipboardToTerminal(tab);
+          return false;
+        }
+        return true;
+      });
+      if (tab.id === state.activeTab) requestAnimationFrame(() => requestAnimationFrame(() => { if (!view.classList.contains('hidden')) { fitTerminal(tab); sendResize(tab); scrollTerminalToBottom(tab, true); } }));
+      tab.terminal.onData((data) => { if (tab.restoring) return; tab.followOutput = true; if (tab.ws?.readyState === WebSocket.OPEN) tab.ws.send(JSON.stringify({ type:'input', data:btoa(unescape(encodeURIComponent(data))) })); if (!terminalAtBottom(tab)) requestAnimationFrame(() => { if (tab.followOutput !== false && !terminalUserScrolling(tab)) { tab.terminal?.scrollToBottom?.(); tab.terminal?.refresh(0, Math.max(0, tab.terminal.rows - 1)); } }); });
       // Scrolling the scrollback has to win against the live tail, otherwise the
       // view snaps back down on the next output chunk and upward wheel/touch
       // motion looks completely dead.  That fight is decided here:
@@ -1899,7 +1982,25 @@ function closeTab(tabId) { const tab = state.tabs.get(tabId); if (!tab) return; 
       attachViewportFollow();
       tab.terminal.onScroll(() => { attachViewportFollow(); syncTerminalFollowFromViewport(); });
       new MutationObserver(attachViewportFollow).observe(terminalElement, { childList:true, subtree:true });
-      terminalElement.addEventListener('paste', async (event) => { const text = event.clipboardData?.getData('text/plain') || ''; if (!hasMultipleLines(text)) return; event.preventDefault(); event.stopImmediatePropagation(); if (await confirmMultilinePaste(text)) pasteIntoTerminal(tab, text); }, true); const resizeObserver = new ResizeObserver(() => { if (tab.id !== state.activeTab || view.classList.contains('hidden') || !terminalElement.offsetWidth || !terminalElement.offsetHeight) return; scheduleTerminalFit(tab); }); resizeObserver.observe(terminalElement); terminalElement.parentElement && resizeObserver.observe(terminalElement.parentElement); if (document.fonts?.ready) document.fonts.ready.then(() => { if (tab.id === state.activeTab) scheduleTerminalFit(tab); }); }
+      terminalElement.addEventListener('paste', async (event) => {
+        const imageFile = [...(event.clipboardData?.files || [])].find((file) => CLIPBOARD_IMAGE_TYPE.test(file.type));
+        if (imageFile) {
+          event.preventDefault();
+          event.stopImmediatePropagation();
+          await pasteClipboardImage(tab, imageFile);
+          return;
+        }
+        const text = event.clipboardData?.getData('text/plain') || '';
+        if (!hasMultipleLines(text)) return;
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        if (await confirmMultilinePaste(text)) pasteIntoTerminal(tab, text);
+      }, true);
+      const resizeObserver = new ResizeObserver(() => { if (tab.id !== state.activeTab || view.classList.contains('hidden') || !terminalElement.offsetWidth || !terminalElement.offsetHeight) return; scheduleTerminalFit(tab); });
+      resizeObserver.observe(terminalElement);
+      terminalElement.parentElement && resizeObserver.observe(terminalElement.parentElement);
+      if (document.fonts?.ready) document.fonts.ready.then(() => { if (tab.id === state.activeTab) scheduleTerminalFit(tab); });
+    }
     view.querySelectorAll('[data-key]').forEach((button) => button.onclick = () => { if (tab.restoring) return; const value = button.dataset.key; tab.terminal?.focus(); if (tab.ws?.readyState === WebSocket.OPEN) tab.ws.send(JSON.stringify({ type:'input', data:btoa(unescape(encodeURIComponent(value))) })); });
     const toggleSftp = async (open = !tab.sftp) => {
       tab.sftp = open;
