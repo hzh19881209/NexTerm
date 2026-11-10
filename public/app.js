@@ -1626,7 +1626,15 @@ function closeTab(tabId) { const tab = state.tabs.get(tabId); if (!tab) return; 
       rfb._gestures?.detach?.();
       rfb._cursor?.detach?.();
       rfb._keyboard?.ungrab?.();
+      // 先走 noVNC 的 disconnect()：状态切到 disconnecting 并启动 _disconnTimer。
+      // 但上面已把 sock._websocket 置空，_disconnect 里的 _sock.close() 不再派发
+      // close 事件，浏览器合成的 close 又被 _forwardClose 守卫拦截，_socketClose
+      // 永远不来，RFB 会卡在 disconnecting 直到 _disconnTimer 触发
+      // "Disconnection timed out."（10 秒后）。这里直接补发一次 _socketClose
+      // 收尾：立即转到 disconnected（clean 保持 true、不弹误报通知），并清除
+      // _disconnTimer，从根上消除该超时日志。
       rfb.disconnect();
+      rfb._socketClose({ code: 1000 });
     } catch { /* already closed */ }
   }
   function createVncTabView(tab, server) {
@@ -1663,9 +1671,13 @@ function closeTab(tabId) { const tab = state.tabs.get(tabId); if (!tab) return; 
       rfb.addEventListener('disconnect', (event) => {
         tab.connected = false;
         renderTabs();
-        // 重连走 reconnectTab：先 disposeVnc 再重建 view/RFB/惰性通道，
-        // 不复用已 disconnected 的旧对象（其状态机不可逆）。
-        if (!tab.manualClose && tab.reconnectAttempt < 6) scheduleReconnect(tab);
+        // 自动重连必须走 reconnectTab 而非 scheduleReconnect：noVNC 的
+        // 'disconnected' 状态不可逆，scheduleReconnect 会经 connectTab 复用
+        // 已断开的 tab.vnc.rfb，其 _socketOpen 无法把状态转回 connecting，
+        // 握手字节被静默丢弃，导致永久 disconnected 并误报
+        // "Disconnection timed out."。reconnectTab 先 disposeVnc 清空
+        // tab.vnc，connectTab 才会重建全新 RFB 与惰性通道。
+        if (!tab.manualClose && tab.reconnectAttempt < 6) reconnectTab(tab);
         const detail = event?.detail || {};
         if (detail.clean || tab.manualClose) return;
         const initState = rfb._rfbInitState || '';
