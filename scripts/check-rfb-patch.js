@@ -2,7 +2,9 @@
 // 用法：node scripts/check-rfb-patch.js
 // 1. 补丁 1：H.264 解码回调 _handleFrame 末尾回收 VideoFrame（frame = {}）；
 // 2. 补丁 2：断开超时 3 秒放大到 10 秒（var ba=10,）；
-// 3. ES module 语法解析（优先 esbuild，缺失时回退 node:vm SourceTextModule）。
+// 3. 补丁 3：渲染队列出队处回收 Image/VideoFrame（e.img&&(e.img=null) 与
+//    typeof e.frame.frame.close=="function"）；
+// 4. ES module 语法解析（优先 esbuild，缺失时回退 node:vm SourceTextModule）。
 const fs = require('fs');
 const path = require('path');
 const { spawnSync } = require('child_process');
@@ -39,6 +41,16 @@ for (const bad of badPatterns) {
 // 校验补丁 1 已就位
 if (!goodPattern.test(code)) {
   console.error('[check-rfb-patch] 补丁 1 未就位（H.264 VideoFrame 回收缺失），请重新运行 scripts/build-rfb-vendor.js 生成并应用补丁');
+  process.exit(1);
+}
+
+// 校验补丁 3 已就位：渲染队列出队处回收 Image / 未关闭的 VideoFrame
+if (!code.includes('e.img&&(e.img=null)')) {
+  console.error('[check-rfb-patch] 补丁 3 未就位（渲染队列 Image 回收缺失），请重新运行 scripts/build-rfb-vendor.js 生成并应用补丁');
+  process.exit(1);
+}
+if (!code.includes('typeof e.frame.frame.close=="function"')) {
+  console.error('[check-rfb-patch] 补丁 3 未就位（渲染队列 VideoFrame 回收缺失），请重新运行 scripts/build-rfb-vendor.js 生成并应用补丁');
   process.exit(1);
 }
 

@@ -8,7 +8,7 @@
 // 该文件被 .gitignore 忽略（public/vendor/ 整个目录不入库），每次构建前由
 // copy-vendor.js 调用本脚本重新生成。需要网络访问 codeload.github.com（GitHub 官方 tarball 分发地址，国内直连更稳定）。
 
-// 对 noVNC 打两个补丁：
+// 对 noVNC 打三个补丁（补丁 1、3 打包前改源码，补丁 2 压缩产物 token 替换）：
 // 1. noVNC v1.6.0 的 H.264 解码器从不回收 VideoFrame，浏览器会反复打印
 //    "A VideoFrame was garbage collected without being closed"，长时间
 //    连接可能造成卡顿。此补丁在打包前直接修改 core/decoders/h264.js 源码
@@ -16,7 +16,15 @@
 //    拼接代码会产生语法错误，导致 window.RFB 挂载失败）；
 // 2. 断开超时 ba 默认 3 秒，本地 ws.close() 之后若 close 事件未能在窗口内
 //    送达 noVNC，会误报 "Disconnection timed out."，改为 10 秒兜底。
-//    此补丁在打包后的压缩产物上修改（单行 token 替换，安全）。
+//    此补丁在打包后的压缩产物上修改（单行 token 替换，安全）；
+// 3. 断开/重连/视图重建后，Display 渲染队列里滞留的解码产物不会被回收：
+//    img 动作持有已解码的 Image（tight/jpeg 等编码），frame 动作持有
+//    H.264 的 pending 包装（close 路径下 VideoFrame 从未被 close）。
+//    Windows 远程桌面交互越频繁（点击/移动触发整屏刷新），堆积越多，
+//    表现为浏览器控制台 "VideoFrame/Image was garbage collected" 类报错
+//    与内存缓慢爬升。此补丁在打包前修改 core/display.js 源码：渲染动作
+//    出队时统一丢弃 Image 引用并关闭其中仍打开的 VideoFrame（与
+//    _scanRenderQ 'frame' 分支的 close 幂等，仅执行一次）。
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
@@ -34,8 +42,12 @@ function clean() {
 }
 
 // 对 esbuild 压缩产物校验/打补丁。
-// 补丁 1 已在打包前以源码方式打入 h264.js，这里只校验产物确实包含补丁语句
-// （"t={}" 位于 _handleFrame 方法体末尾，后接 _handleError 方法）；
+// 补丁 1、3 已在打包前以源码方式打入 h264.js / display.js，这里校验产物
+// 确实包含补丁语句：
+//   - 补丁 1："t={}" 位于 _handleFrame 方法体末尾，后接 _handleError 方法；
+//   - 补丁 3：出队处出现 "e.img&&(e.img=null)" 与
+//     'typeof e.frame.frame.close=="function"'（变量名 e 为本构建 esbuild
+//     压缩结果，升级 esbuild 若导致改名需同步调整）。
 // 补丁 2 是单行 token 替换（ba=3 -> ba=10），可直接在压缩产物上进行。
 // 注意：必须用 RegExp（带 lastIndex 循环）查找，不能用 String.prototype.includes。
 // esbuild 压缩产物中方法体末尾 "t={}" 恰以 } 结尾，后续代码中若出现
@@ -49,13 +61,21 @@ function applyNovncPatches(file) {
     fail('noVNC 补丁 1 未进入产物（H.264 _handleFrame 源码补丁未生效），请检查 core/decoders/h264.js 的锚点');
   }
 
+  // 校验补丁 3（渲染队列出队回收 Image/VideoFrame）已进入产物。
+  if (!code.includes('e.img&&(e.img=null)')) {
+    fail('noVNC 补丁 3 未进入产物（渲染队列 Image 回收缺失），请检查 core/display.js 的锚点');
+  }
+  if (!code.includes('typeof e.frame.frame.close=="function"')) {
+    fail('noVNC 补丁 3 未进入产物（渲染队列 VideoFrame 回收缺失），请检查 core/display.js 的锚点');
+  }
+
   // 补丁 2：断开超时 ba 从 3 秒放大到 10 秒。
   const timeoutAnchor = 'var ba=3,';
   if (!code.includes(timeoutAnchor)) fail('noVNC 补丁 2 锚点未找到（断开超时 ba），产物未打补丁');
   code = code.replace(timeoutAnchor, 'var ba=10,', 1);
 
   fs.writeFileSync(file, code);
-  console.log('[build-rfb-vendor] 已校验 H.264 VideoFrame 回收补丁，并应用断开超时补丁');
+  console.log('[build-rfb-vendor] 已校验 H.264 回收补丁与渲染队列回收补丁，并应用断开超时补丁');
 }
 
 function fail(message) {
@@ -82,9 +102,13 @@ try {
   if (!fs.existsSync(path.join(core, 'rfb.js'))) fail('noVNC 源码缺少 core/rfb.js');
 
   // 补丁 1：H.264 解码回调 _handleFrame 中，pending 帧不保留时回收 VideoFrame。
-  // 在打包前修改源码，避免事后对 minify 产物拼接代码导致语法错误
-  // （esbuild 压缩后相邻 class 方法之间没有分号/换行，"t={}" 后直接拼接
-  //   方法名会被解析为对象字面量属性）。
+  // 补丁 3：渲染动作出队（_scanRenderQ 的 ready 分支）时回收 img/frame
+  // 动作持有的解码资源。两处都在打包前修改源码，避免事后对 minify 产物
+  // 拼接代码导致语法错误（esbuild 压缩后相邻 class 方法之间没有分号/换行，
+  // "t={}" 后直接拼接方法名会被解析为对象字面量属性）。
+  // 注意：不要在 case 分支内做 "a.img = null" 式清理——变量随后不再被读取
+  // 时 esbuild 会把它当死代码删掉；放在出队处（赋值后紧跟 shift() 读取）
+  // 才能稳定保留。
   const h264File = path.join(core, 'decoders', 'h264.js');
   let h264Source = fs.readFileSync(h264File, 'utf8');
   const h264Anchor = '        pending.frame = frame;\n        pending.ready = true;\n        pending.resolve();\n\n        if (!pending.keep) {\n            frame.close();\n        }\n    }';
@@ -92,6 +116,37 @@ try {
   if (!h264Source.includes(h264Anchor)) fail('noVNC h264.js 补丁 1 锚点未找到（_handleFrame），请核对 noVNC 版本');
   h264Source = h264Source.replace(h264Anchor, h264Patched, 1);
   fs.writeFileSync(h264File, h264Source);
+
+  // 补丁 3：渲染动作出队时回收解码资源（Image / 未关闭的 VideoFrame）。
+  // 渲染队列只随动作出队释放，而断开/重连/视图重建不会清空它：
+  //  - img 动作（tight/jpeg 等）里的 Image 已画到 canvas，解码缓冲却挂在
+  //    队列对象上，只能等 GC（Firefox 尤其明显，内存可爬到 GB 级）；
+  //  - frame 动作的 pending 包装在 _handleFrame 不保留分支已 close 过
+  //    VideoFrame，这里再 close 是幂等的；close 路径（无解码回调）下
+  //    队列里的帧从未被 close，这里兜底。
+  const displayFile = path.join(core, 'display.js');
+  let displaySource = fs.readFileSync(displayFile, 'utf8');
+  const displayAnchor = '            if (ready) {\n                this._renderQ.shift();\n            }';
+  const displayPatched = [
+    '            if (ready) {',
+    '                // NexTerm patch: release resources held by the finished render',
+    '                // action (decoded images and H.264 VideoFrames) so they do not',
+    '                // linger in the queue waiting for GC.',
+    "                if (a.img) {",
+    '                    a.img = null;',
+    '                }',
+    '                if (a.frame) {',
+    "                    if (a.frame.frame && typeof a.frame.frame.close === 'function') {",
+    '                        a.frame.frame.close();',
+    '                    }',
+    '                    a.frame = null;',
+    '                }',
+    '                this._renderQ.shift();',
+    '            }',
+  ].join('\n');
+  if (!displaySource.includes(displayAnchor)) fail('noVNC display.js 补丁 3 锚点未找到（_scanRenderQ 出队处），请核对 noVNC 版本');
+  displaySource = displaySource.replace(displayAnchor, displayPatched, 1);
+  fs.writeFileSync(displayFile, displaySource);
 
   const entry = path.join(tmp, 'rfb-entry.js');
   fs.writeFileSync(entry, `import RFB from '${core.replace(/\\/g, '/')}/rfb.js';\nwindow.RFB = RFB;\n`);
