@@ -18,6 +18,13 @@ try {
   console.error('[copy-vendor] 生成 rfb-bootstrap.js 失败，中止构建');
   process.exit(1);
 }
+// 二次防线：校验产物补丁完整且语法正确，避免发出 window.RFB 缺失的坏文件。
+try {
+  require('child_process').execFileSync(process.execPath, [path.join(root, 'scripts', 'check-rfb-patch.js')], { stdio: 'inherit' });
+} catch (error) {
+  console.error('[copy-vendor] rfb-bootstrap.js 补丁/语法校验失败，中止构建');
+  process.exit(1);
+}
 
 for (const [source, destination] of assets) {
   const from = path.join(root, 'node_modules', source);
