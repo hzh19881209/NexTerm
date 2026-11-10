@@ -205,6 +205,21 @@ test('approval handles long download commands and approves public downloads', as
   assert.match(block, /Would you like to run this command\?/, 'the prompt line must stay in the block');
   const prompt = serverSource.slice(serverSource.indexOf('function approvalSystemPrompt()'), serverSource.indexOf('function buildApprovalMessages('));
   assert.match(prompt, /6a\./, 'public downloads must be explicitly approvable');
-  assert.match(prompt, /curl\|sh/, 'pipe-to-shell must still be blocked');
+  assert.match(prompt, /curl\|sh/, 'pipe-to-shell handling must stay documented');
   assert.match(prompt, /不因“来自外部”而拒绝/, 'external origin alone must not trigger deny');
+});
+
+// The user asked for a deliberately permissive approval model: ordinary file,
+// container and service operations should be approved, while only clearly
+// catastrophic system-wide destruction is handed back to the human.
+test('approval prompt only rejects catastrophic system-wide destruction', async (t) => {
+  const serverSource = fs.readFileSync(path.join(__dirname, '../server.js'), 'utf8');
+  const prompt = serverSource.slice(serverSource.indexOf('function approvalSystemPrompt()'), serverSource.indexOf('function buildApprovalMessages('));
+  assert.match(prompt, /默认尽量放行/);
+  assert.match(prompt, /删除或清理某个具体目录中的文件属于普通操作/);
+  assert.match(prompt, /docker rm\/rmi/);
+  assert.match(prompt, /只有命令明确会造成大范围、不可逆的系统级破坏/);
+  assert.match(prompt, /不要用 deny、unsafe 或 unknown 代替判断/);
+  assert.match(prompt, /即使命令较长、参数复杂、含有变量\/通配符或无法完全看清影响/);
+  assert.doesNotMatch(prompt, /写入项目外路径、修改系统配置、开放端口、创建远端资源、涉及账号凭据、跨主机操作、影响面大或意图不明确：deny/);
 });

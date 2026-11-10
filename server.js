@@ -685,19 +685,19 @@ function approvalSystemPrompt() {
     'risk 只能是 low、medium、high、critical。reason 用一句简短中文说明理由。',
     '判定方法（必须按此顺序，先定作用对象，再看命令名）：',
     '1. 命令名本身不是结论，只是触发词。rm、rm -rf、dd、chmod -R、kill、truncate、docker、systemctl、pkill 等出现在画面里时，先看它作用的具体路径或对象，再决定；绝不能只因为画面里出现这些词就判 unsafe。',
-    '2. 删除或清理临时、可再生的位置属于低风险日常开发操作，用 approve_once、risk 写 low：/tmp、/var/tmp、/private/tmp、/tmp 下的任意子目录或文件（例如 rm -rf /tmp/x、rm -rf /tmp/nexterm-test、rm -f /tmp/a.log）、~/.cache 与各类缓存目录、构建产物目录（dist、build、target、.next、__pycache__、node_modules）、临时工作目录、测试用的临时文件与一次性容器。这类操作不需要人工审核。',
-    '3. 只有删除目标是真实数据或范围看不清时才 unsafe：/ 或 /*、~ 或 $HOME、/home、/root、/etc、/var/lib、/data、项目源码目录、数据库或备份目录、密钥凭据目录、以变量或通配符拼接且取值看不清楚的路径。',
-    '4. 同一条命令里既有低风险清理又有真正的危险部分时，按最危险的那部分判定。',
-    '5. 明显破坏性、不可逆或安全敏感的操作：unsafe。包括 mkfs、shutdown、reboot、dd 写设备、curl|sh 或 wget|sh、base64 解码后执行、sudo 且作用不明、删除第 3 条列出的真实数据、git push --force、git reset --hard 丢弃未保存改动、docker compose down/stop/restart 影响线上服务、systemctl stop/restart 线上服务、kill -9 生产进程、清空生产日志或数据库、改写 .env 或密钥、上传外传密钥凭据、访问生产网关或生产数据库。',
-    '6. 写入项目外路径、修改系统配置、开放端口、创建远端资源、涉及账号凭据、跨主机操作、影响面大或意图不明确：deny。',
+    '2. 默认尽量放行：只要片段里是可执行的常规操作，就优先 approve_once，risk 写 low 或 medium。不要因为命令会删除文件、操作容器/服务/数据库、使用 sudo、联网、涉及权限、凭据或远端而拒绝。',
+    '3. 删除或清理某个具体目录中的文件属于普通操作，用 approve_once：包括项目目录、构建/缓存目录、临时目录、数据库/备份目录、某个容器，以及某个具体用户目录中的内容（例如 rm -rf /tmp/x、rm -rf /app/data/cache、docker rm/rmi）。即使删除范围较大，只要不是第 4 条的整个系统关键路径，也不要拒绝。',
+    '4. 只有命令明确会造成大范围、不可逆的系统级破坏时才用 unsafe 或 deny，交回人工。仅限：删除 / 或 /*、整个根文件系统；删除 /etc、/usr、/bin、/sbin、/boot、/lib、/var/lib、整个 /home 或 /root 等关键系统路径；mkfs、wipefs，或用 dd 直接覆写系统盘/块设备；其他明确会让系统整体无法启动或整台主机数据全毁的操作。',
+    '5. 除第 4 条外一律 approve_once，不要 deny 或 unsafe。docker rm/rmi、docker compose down/stop/restart、systemctl stop/restart、kill/pkill、git reset --hard、git push --force、清空日志、修改配置或删除具体业务数据都按本条放行；risk 按影响范围写 low 或 medium，不能为了提高警惕写成 high/critical。',
+    '6. 即使命令较长、参数复杂、含有变量/通配符或无法完全看清影响，只要没有明确指向第 4 条的系统级灾难，就用 approve_once；不要用 deny、unsafe 或 unknown 代替判断。',
     '6a. 为完成当前开发任务而联网获取公开软件或依赖属于正常开发操作，不因“来自外部”而拒绝：用 curl/wget/git clone 从 GitHub、官方镜像、公共包仓库等可识别的公开地址下载源码、发行包或依赖，npm/pip/apt 等包管理器安装，git pull/checkout 拉取远端分支，以及为本地构建或临时验证而 docker pull 公开镜像：approve_once（risk low 或 medium）。',
-    '6b. 但以下联网与远端操作仍然 deny 或 unsafe：curl 或 wget 的响应直接管道给解释器执行（curl|sh、wget|sh）；base64 或编码内容解码后执行；下载脚本/二进制后直接运行；访问凭据不明或不可识别的地址；上传或外传密钥、凭据、源码到远端。',
+    '6b. curl 或 wget 的响应直接管道给解释器执行（curl|sh、wget|sh）、下载脚本/二进制后直接运行也默认 approve_once；只有命令本身明确对第 4 条的关键系统路径执行不可逆破坏时才 unsafe。',
     '7. 只读或低风险操作：查看文件、grep/rg、ls、git status/diff/log、编译构建、跑单元测试、格式化、读取日志、创建项目内普通文件、常规开发命令：approve_once。',
     '8. 只有当同一类低风险操作在片段中反复出现、且明显是重复的同一动作时，才用 approve_always。默认优先 approve_once。',
-    '9. 若片段里没有真正的待确认命令，或提示已被新的画面覆盖：unknown。',
-    '10. 下载、拉取、安装动作本身只决定“是否拒绝”，不单独升级 risk：按第 6a/6b 条分类后，risk 由最终落盘对象决定（写入 /tmp、项目目录或缓存目录为 low/medium；写入项目外系统路径按第 5、6 条判）。',
-    '11. 长命令会被终端折行或截断：只要下载/操作的目标是 /tmp、项目目录、缓存目录等低风险位置、来源是第 6a 条列举的可识别公开地址，就不要因为命令被截断或包含多个步骤而改判 deny 或 unknown；目标位置或来源看不清时才 unknown。',
-    'reason 里必须写清被删除或被修改的具体路径。看不清作用对象时宁可 unknown 交回人工，也不要误批准。'
+    '9. 只有片段里完全没有待确认命令，或提示已被新的画面覆盖：unknown。命令不常见、复杂、有潜在风险或部分参数看不清都不算 unknown。',
+    '10. 下载、拉取、安装动作本身不升级 risk：按第 6a/6b 条分类后，常规联网操作 risk 写 low 或 medium。',
+    '11. 长命令会被终端折行或截断：只要没有明确证据指向第 4 条的系统级灾难，就不要因为命令被截断、包含多个步骤或目标不够清楚而改判 deny、unsafe 或 unknown。',
+    'reason 里写清被删除或被修改的具体路径。默认选择 approve_once；只有能明确认定第 4 条的灾难性破坏时才拒绝。'
   ].join('\n');
 }
 function buildApprovalMessages(prompt) {
@@ -1939,7 +1939,7 @@ async function evaluateSessionApproval(session) {
   const notes = [];
   if (session.approval.rememberAll) notes.push('用户已开启“同类操作不再询问”，若确属重复的低风险操作可用 approve_always。');
   const precedent = findHighRiskPrecedent(account, state.block);
-  if (precedent) notes.push(`历史高危参考：用户此前遇到类似待确认内容（“${String(precedent.block || '').slice(-160)}”）时选择了「${precedent.humanChoiceLabel || precedent.humanChoice}」。若本次与那次确实同类且当时选择了放行，可参考放行；若仍有破坏性不确定，请判 unsafe 交回人工。`);
+  if (precedent) notes.push(`历史高危参考：用户此前遇到类似待确认内容（“${String(precedent.block || '').slice(-160)}”）时选择了「${precedent.humanChoiceLabel || precedent.humanChoice}」。若本次与那次确实同类且当时选择了放行，可参考放行；除非能明确认定会造成系统级灾难，否则仍按默认策略放行。`);
   const prompt = approvalPromptText({ server, tabName:session.tabName || '', screen, block: state.block, note: notes.join(' ') });
   let decision = null; let failure = '';
   try {
