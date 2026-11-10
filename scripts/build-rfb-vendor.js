@@ -33,17 +33,19 @@ function clean() {
   try { fs.rmSync(tmp, { recursive: true, force: true }); } catch { /* ignore */ }
 }
 
-// 对 esbuild 压缩产物打补丁。锚点是 minify 后的稳定代码片段，
-// 若上游 noVNC 版本更新导致锚点漂移，直接失败中止构建，避免发出未打补丁的坏文件。
 // 对 esbuild 压缩产物校验/打补丁。
-// 补丁 1 已在打包前以源码方式打入 h264.js，这里只校验产物确实包含补丁语句；
+// 补丁 1 已在打包前以源码方式打入 h264.js，这里只校验产物确实包含补丁语句
+// （"t={}" 位于 _handleFrame 方法体末尾，后接 _handleError 方法）；
 // 补丁 2 是单行 token 替换（ba=3 -> ba=10），可直接在压缩产物上进行。
+// 注意：必须用 RegExp（带 lastIndex 循环）查找，不能用 String.prototype.includes。
+// esbuild 压缩产物中方法体末尾 "t={}" 恰以 } 结尾，后续代码中若出现
+// "t={}" 字符串字面量（如 "t={}'"），includes 会命中错误位置导致误判。
 function applyNovncPatches(file) {
   let code = fs.readFileSync(file, 'utf8');
 
   // 校验补丁 1（H.264 VideoFrame 回收）已进入产物。
-  // 源码补丁语句 "frame = {};" 压缩后为 "t={};"，位于 _handleFrame 方法体末尾。
-  if (!code.includes('t={}_handleError') && !code.includes('t={}\n_handleError')) {
+  const patch1Pattern = /t=\{\}\}\s*_handleError/;
+  if (!patch1Pattern.test(code)) {
     fail('noVNC 补丁 1 未进入产物（H.264 _handleFrame 源码补丁未生效），请检查 core/decoders/h264.js 的锚点');
   }
 

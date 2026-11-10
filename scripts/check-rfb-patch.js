@@ -18,24 +18,26 @@ let code = fs.readFileSync(file, 'utf8');
 let changed = false;
 
 // 正确形态："t={}" 位于 _handleFrame 方法体末尾，后接 _handleError 方法。
-const good = 'e.resolve(),e.keep||t.close(),t={}}_handleError';
+// 必须用 RegExp 查找：esbuild 压缩产物中方法体末尾 "t={}" 恰以 } 结尾，
+// 后续代码若出现 "t={}" 字符串字面量（如 "t={}'"），String.prototype.includes
+// 会命中错误位置，把本来完好的产物误判为损坏。
+const goodPattern = /e\.resolve\(\),e\.keep\|\|t\.close\(\),t=\{\}\}\s*_handleError/;
 // 历史损坏形态：补丁 1 曾被直接拼接到 minify 产物上，方法体缺少收尾括号
 // （"t={}_handleError" 会把 _handleError 解析成对象字面量属性），整文件
 // SyntaxError，window.RFB 无法挂载。两种变体：无换行 / 补丁时误加换行。
-const bads = [
-  'e.resolve(),e.keep||t.close(),t={}_handleError',
-  'e.resolve(),e.keep||t.close(),t={}\n_handleError',
+const badPatterns = [
+  /e\.resolve\(\),e\.keep\|\|t\.close\(\),t=\{\}\}\s+_handleError/,
 ];
-for (const bad of bads) {
-  if (code.includes(bad)) {
-    code = code.replace(bad, good, 1);
+for (const bad of badPatterns) {
+  if (bad.test(code)) {
+    code = code.replace(bad, 'e.resolve(),e.keep||t.close(),t={}}_handleError', 1);
     changed = true;
     console.log('[check-rfb-patch] 修复了补丁 1 损坏（_handleFrame 方法体缺少收尾括号）');
   }
 }
 
 // 校验补丁 1 已就位
-if (!code.includes(good)) {
+if (!goodPattern.test(code)) {
   console.error('[check-rfb-patch] 补丁 1 未就位（H.264 VideoFrame 回收缺失），请重新运行 scripts/build-rfb-vendor.js 生成并应用补丁');
   process.exit(1);
 }
