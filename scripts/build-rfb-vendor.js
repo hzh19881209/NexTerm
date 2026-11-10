@@ -6,14 +6,14 @@
 // window.RFB，供 index.html 里 type="module" 的 rfb-bootstrap.js 使用。
 //
 // 该文件被 .gitignore 忽略（public/vendor/ 整个目录不入库），每次构建前由
-// copy-vendor.js 调用本脚本重新生成。需要网络访问 github.com。
+// copy-vendor.js 调用本脚本重新生成。需要网络访问 codeload.github.com（GitHub 官方 tarball 分发地址，国内直连更稳定）。
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { execFileSync, spawnSync } = require('child_process');
 
 const NOVNC_TAG = 'v1.6.0';
-const NOVNC_URL = `https://github.com/novnc/noVNC/archive/refs/tags/${NOVNC_TAG}.tar.gz`;
+const NOVNC_URL = `https://codeload.github.com/novnc/noVNC/tar.gz/refs/tags/${NOVNC_TAG}`;
 const root = path.resolve(__dirname, '..');
 const vendor = path.join(root, 'public', 'vendor');
 const outJs = path.join(vendor, 'rfb-bootstrap.js');
