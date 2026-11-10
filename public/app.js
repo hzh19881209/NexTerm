@@ -979,6 +979,16 @@
     const model = (state.user?.approvalModels || []).find((item) => item.id === modelId);
     return model ? `${model.name} · ${model.model}` : '';
   }
+  function tabApprovalModelHint(tab) {
+    if (!tab || tab.kind !== 'ssh' || !tab.approvalEnabled) return '';
+    const models = state.user?.approvalModels || [];
+    if (tab.approvalModelId) {
+      const label = approvalModelLabel(tab.approvalModelId);
+      return label ? `审批模型：${label}（本标签单独设置）` : '审批模型：未选择';
+    }
+    const defaultId = defaultApprovalModelId();
+    return defaultId ? `审批模型：${approvalModelLabel(defaultId)}（跟随默认）` : '审批模型：未配置';
+  }
   function approvalBadgeLabel(tab) {
     if (tab.approvalEnabled) return tab.approvalStatus || (tab.approvalRememberAll ? '自动审批（不再询问）' : '自动审批已开启');
     if (tab.approvalStopReason) return '自动审批已停止';
@@ -1007,6 +1017,13 @@
         historyLink.classList.toggle('hidden', !label);
         historyLink.classList.toggle('danger', tab.approvalTone === 'error');
         historyLink.title = tab.approvalTone === 'error' ? '高危提示等待处理 · 点击查看审批记录' : '查看自动审批记录';
+      }
+      const modelHint = tabApprovalModelHint(tab);
+      badge.title = modelHint ? `${label} · ${modelHint}` : (label || '');
+      if (historyLink && historyLink !== badge) {
+        historyLink.title = modelHint
+          ? `${historyLink.title} · ${modelHint}`
+          : historyLink.title;
       }
     });
   }
@@ -1073,6 +1090,39 @@
   function toggleTabApproval(tab) {
     if (!tab) return;
     if (tab.approvalEnabled) disableTabApproval(tab); else void enableTabApproval(tab);
+  }
+  // Pick (or clear) the approval model for one terminal tab.  An explicit
+  // choice overrides the account default for this tab only; an empty value
+  // restores default-model tracking so later default changes follow the tab.
+  function applyTabApprovalModel(tab, modelId) {
+    if (!tab) return;
+    const models = state.user?.approvalModels || [];
+    const validId = models.some((item) => item.id === modelId) ? modelId : '';
+    tab.approvalModelId = validId;
+    if (tab.kind === 'ssh' && tab.approvalEnabled) {
+      if (sendApprovalControl(tab, 'enable', validId ? { modelId:validId } : {})) {
+        setTabApprovalStatus(tab, validId ? `已切换 · ${approvalModelLabel(validId)}` : '已改用默认模型', 'info', 4000);
+      }
+    }
+    persistSessions(); renderTabs();
+  }
+  function openTabApprovalModelPicker(tab) {
+    if (!tab) return;
+    const models = state.user?.approvalModels || [];
+    const backdrop = document.createElement('div');
+    backdrop.className = 'modal-backdrop';
+    const options = models.map((item) => {
+      const disabled = item.enabled === false;
+      const current = !disabled && item.id === tab.approvalModelId;
+      return `<button type="button" class="approval-model-option${disabled ? ' disabled' : ''}${current ? ' current' : ''}" data-model-id="${escapeHtml(item.id)}" ${disabled ? 'disabled' : ''}><strong>${escapeHtml(item.name)}${current ? '（当前）' : ''}</strong><small>${escapeHtml(maskApprovalSecrets(item.baseUrl))} · ${escapeHtml(maskApprovalSecrets(item.model))}${disabled ? ' · 已停用' : ''}</small></button>`;
+    }).join('');
+    backdrop.innerHTML = `<div class="modal approval-modal"><div class="modal-head"><h3>本标签审批模型</h3><button type="button" class="icon-btn" data-close aria-label="关闭">×</button></div><div class="modal-body"><p class="settings-note">只影响标签「${escapeHtml(tab.name)}」：开启自动审批时使用这里选择的模型；选择「跟随默认」则跟随账户默认审批模型。</p><button type="button" class="approval-model-option follow-default${tab.approvalModelId === '' ? ' current' : ''}" data-model-id=""><strong>跟随默认</strong><small>账户默认模型变更时自动跟随</small></button>${options || '<div class="empty">还没有配置审批模型，请先在「设置 → 自动审批模型」中添加。</div>'}</div><div class="modal-actions"><button type="button" class="secondary" data-close>关闭</button></div></div>`;
+    document.body.appendChild(backdrop);
+    backdrop.querySelectorAll('[data-close]').forEach((button) => button.onclick = () => backdrop.remove());
+    backdrop.querySelectorAll('.approval-model-option').forEach((button) => button.onclick = () => {
+      applyTabApprovalModel(tab, button.dataset.modelId || '');
+      backdrop.remove();
+    });
   }
   function rearmTabApproval(tab) {
     if (!tab || tab.kind !== 'ssh') return;
@@ -1228,9 +1278,18 @@
     if (!buffer) return false;
     return Number(buffer.viewportY) >= Number(buffer.baseY) + Number(terminal.rows || 0) - 1;
   }
+  // History lives in the NORMAL buffer.  Full-screen TUIs (Codex) switch the
+  // active buffer to the alternate one, which is exactly the screen session
+  // output is appended to afterwards - while the TUI is running the alternate
+  // buffer itself never accumulates scrollback (it is pinned to the viewport),
+  // so judging availability from the active buffer kept the local takeover off
+  // and upward wheel motion was forwarded to the TUI as cursor keys: the
+  // reader could not scroll until the TUI exited.  Judge the normal buffer
+  // instead: it already holds the completed session's output, and when it is
+  // empty (a TUI started from a fresh shell) the wheel is left to the TUI.
   function terminalScrollbackAvailable(tab) {
-    const buffer = tab?.terminal?.buffer?.active;
-    if (!buffer || buffer.type === 'alternate' || buffer.hasScrollback === false) return false;
+    const buffer = tab?.terminal?.buffer?.normal;
+    if (!buffer) return false;
     return Number(buffer.baseY || 0) > 0;
   }
   function scrollTerminalToBottom(tab, force = false) {
@@ -1975,15 +2034,19 @@ function closeTab(tabId) { const tab = state.tabs.get(tabId); if (!tab) return; 
             scrollHistoryByPixels(wheelPixels(event));
             return;
           }
+          // A full-screen TUI (Codex) with mouse reporting enabled pins the
+          // viewport to its live tail, so "already at the bottom" is the TUI's
+          // normal idle state and a downward wheel tick means the reader is
+          // not paging back into history: do not re-arm follow from it.
+          if (event.deltaY > 0 && terminalUsesMouseReporting(tab) && !terminalScrollbackAvailable(tab)) return;
           // Scrolling back down to the live tail re-arms follow; anything else is
           // the reader taking control. macOS momentum keeps firing after the
           // gesture ends, so follow must not be re-derived from delta signs.
           tab.followOutput = event.deltaY > 0 && terminalAtBottom(tab);
-          if (event.deltaY >= 0 || !terminalUsesMouseReporting(tab)) return;
-          // Terminal mouse reporting (Codex, htop, less) owns the viewport, so
-          // native scrolling stays the normal path there.
-          if (scrollState.momentumPaused) { scrollState.pendingMomentum += event.deltaY; scheduleMomentum(); return; }
-          if (scrollHistoryDepth() <= 0) {
+          if (event.deltaY < 0 && terminalUsesMouseReporting(tab) && scrollHistoryDepth() <= 0) {
+            // The TUI owns the viewport and there is no local history left to
+            // consume: absorb the rest of the flick instead of letting xterm
+            // re-clamp the viewport on the next frame.
             scrollState.momentumPaused = true;
             scrollState.pendingMomentum = event.deltaY;
             event.preventDefault();
@@ -2468,9 +2531,11 @@ function closeTab(tabId) { const tab = state.tabs.get(tabId); if (!tab) return; 
     const scopeSessionName = live ? (live.name || '') : '';
     const scopeHost = live ? (state.servers.find((item) => item.id === live.serverId)?.host || '') : '';
     const scopeLabel = scopeHost ? `${scopeSessionName || '当前标签'} · ${scopeHost}` : (scopeSessionName || '当前标签');
-    backdrop.innerHTML = `<div class="modal approval-modal"><div class="modal-head"><h3>自动审批记录 · <small style="font-weight:500;color:var(--muted)">${escapeHtml(scopeLabel)}</small></h3><button type="button" class="icon-btn" data-close aria-label="关闭">×</button></div><div class="modal-body"><div class="approval-history"><h4>最近一次停止</h4><div class="approval-history-list" data-history-stop><div class="empty">正在加载…</div></div><h4>高危人工处理</h4><div class="approval-history-list" data-history-high><div class="empty">正在加载…</div></div><h4>最近模型决定</h4><div class="approval-history-list" data-history-decisions><div class="empty">正在加载…</div></div></div></div><div class="modal-actions"><button type="button" class="secondary" data-close>关闭</button></div></div>`;
+    backdrop.innerHTML = `<div class="modal approval-modal"><div class="modal-head"><h3>自动审批记录 · <small style="font-weight:500;color:var(--muted)">${escapeHtml(scopeLabel)}</small></h3><button type="button" class="secondary" data-tab-model-picker${live?.kind === 'ssh' ? '' : ' hidden'} title="为当前标签单独选择自动审批模型">本标签审批模型</button><button type="button" class="icon-btn" data-close aria-label="关闭">×</button></div><div class="modal-body"><div class="approval-history"><h4>最近一次停止</h4><div class="approval-history-list" data-history-stop><div class="empty">正在加载…</div></div><h4>高危人工处理</h4><div class="approval-history-list" data-history-high><div class="empty">正在加载…</div></div><h4>最近模型决定</h4><div class="approval-history-list" data-history-decisions><div class="empty">正在加载…</div></div></div></div><div class="modal-actions"><button type="button" class="secondary" data-close>关闭</button></div></div>`;
     document.body.appendChild(backdrop);
     backdrop.querySelectorAll('[data-close]').forEach((button) => button.onclick = () => backdrop.remove());
+    const modelPickerButton = $('[data-tab-model-picker]', backdrop);
+    if (modelPickerButton) modelPickerButton.onclick = () => { backdrop.remove(); openTabApprovalModelPicker(live); };
     const escape = escapeHtml;
     const fmtTime = (value) => { try { return new Date(value).toLocaleString(); } catch { return String(value || ''); } };
     const RISK_LABELS = { low:'低', medium:'中', high:'高', critical:'严重' };

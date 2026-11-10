@@ -183,6 +183,12 @@ button { border: 0; cursor: pointer; color: inherit; }
 @keyframes approval-danger-pulse { 0%,100% { box-shadow:0 0 0 0 rgb(255 126 136 / 0); } 50% { box-shadow:0 0 0 3px rgb(255 126 136 / .18); } }
 .approval-history-link { border:1px solid var(--line); background:var(--panel-2); color:var(--muted); border-radius:999px; padding:4px 9px; font-size:11px; cursor:pointer; }
 .approval-history-link.danger { border-color:rgb(255 126 136 / .42); background:rgb(255 126 136 / .1); color:#ffb3ba; }
+.approval-model-option { display:block; width:100%; text-align:left; margin:6px 0; padding:10px 12px; border:1px solid var(--line); background:var(--panel-2); color:var(--text); border-radius:10px; cursor:pointer; }
+.approval-model-option strong { display:block; font-size:13px; }
+.approval-model-option small { display:block; margin-top:2px; color:var(--muted); font-size:11px; word-break:break-all; }
+.approval-model-option.current { border-color:var(--accent-2); background:rgb(83 183 255 / .1); }
+.approval-model-option.disabled { opacity:.5; cursor:not-allowed; }
+.modal-head .secondary { margin-left:12px; }
 .approval-history h4 { margin:14px 0 8px; font-size:13px; color:var(--muted); }
 .approval-history h4:first-child { margin-top:0; }
 .approval-history-list { display:flex; flex-direction:column; gap:9px; max-height:50vh; overflow:auto; }
