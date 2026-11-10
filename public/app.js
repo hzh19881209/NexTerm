@@ -1605,7 +1605,29 @@ function closeTab(tabId) { const tab = state.tabs.get(tabId); if (!tab) return; 
     const vnc = tab?.vnc;
     if (!vnc) return;
     tab.vnc = null;
-    try { vnc.rfb?.disconnect(); } catch { /* already closed */ }
+    const rfb = vnc.rfb;
+    if (!rfb) return;
+    // 先解除惰性通道与 RFB 内部 Websock 的绑定：closeTab / reconnectTab 会
+    // 紧随其后关闭 tab.ws，浏览器合成的 close 事件若仍在 noVNC 的 30 秒
+    // 断开超时窗口内触发，_socketClose 会抢先执行 _fail 并打印
+    // "Disconnection timed out."（实际是本地关闭的合成事件被误判为
+    // 服务端断开）。detach 后 _websocket 为空，_sock.close() 不关 ws、
+    // 不发 close 事件，disconnect 可即时完成状态机收尾。
+    const lazyChannel = tab._lazyChannel;
+    if (lazyChannel) tab._lazyChannel = null;
+    try {
+      const sock = rfb._sock;
+      if (sock) {
+        sock.off('open'); sock.off('close'); sock.off('message'); sock.off('error');
+        sock._websocket = null;
+      }
+      if (lazyChannel && rfb._rawChannel === lazyChannel) rfb._rawChannel = null;
+      rfb._resizeObserver?.disconnect?.();
+      rfb._gestures?.detach?.();
+      rfb._cursor?.detach?.();
+      rfb._keyboard?.ungrab?.();
+      rfb.disconnect();
+    } catch { /* already closed */ }
   }
   function createVncTabView(tab, server) {
     // 注意：不能在这里 disposeVnc。disposeVnc 只调 rfb.disconnect()，
