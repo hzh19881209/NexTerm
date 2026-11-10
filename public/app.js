@@ -18,7 +18,11 @@
   const CODEX_ACTIVE_PATTERN = /(?:^|\n)\s*[•●]\s+.+\(\s*\d+(?:s|m|h).*?esc\s+to\s+interr/i;
   const CODEX_IDLE_PATTERN = /(?:^|\n)\s*›\s*Ask Codex to do anything\s*(?:\n|$)/i;
   const CODEX_COMPLETE_PATTERN = /(?:^|\n)\s*[─━-]+\s*Worked for\s+\d[^\n]*/i;
-  const INPUT_REQUIRED_PATTERN = /(?:Would you like to (?:run|apply|execute)|Press enter to confirm or esc to|Question\s+\d+\/\d+\s+\(\d+\s+unanswered\)|enter to submit answer|needs your approval|Approval requested|main needs input|请确认|需要确认|是否继续(?:执行)?|等待(?:用户)?确认)/i;
+  // Match only Codex's structured approval/question UI. Ordinary logs may
+  // contain generic words such as "等待确认" without waiting for user input.
+  const CODEX_APPROVAL_MENU_PATTERN = /(?:^|\n)\s*(?:›\s*)?1\.\s*Yes,\s*proceed\b[\s\S]{0,2000}?(?:(?:^|\n)\s*(?:›\s*)?[23]\.\s*(?:Yes,|No,)|(?:^|\n)\s*Press enter to confirm or esc to cancel)/i;
+  const CODEX_QUESTION_PATTERN = /(?:^|\n)\s*Question\s+\d+\/\d+\s+\(\d+\s+unanswered\)[\s\S]{0,2000}?(?:^|\n)\s*enter to submit answer/i;
+  const INPUT_REQUIRED_PATTERN = /(?:Would you like to (?:run|apply|execute)|Press enter to confirm or esc to|Question\s+\d+\/\d+\s+\(\d+\s+unanswered\)|enter to submit answer|needs your approval|Approval requested|main needs input)/i;
   const FONT_STACKS = { system: 'Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif', modern: '"Segoe UI", Inter, Roboto, Arial, sans-serif', serif: 'Georgia, "Times New Roman", serif', monospace: '"SFMono-Regular", Consolas, "Liberation Mono", monospace' };
   const ICONS = { sftp:'<svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M3.5 6.5h6l2 2h9v9.5a2 2 0 0 1-2 2h-15a2 2 0 0 1-2-2V8.5a2 2 0 0 1 2-2Z"/><path d="M8 14h8m-3-3 3 3-3 3"/></svg>', reconnect:'<svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 7v5h-5"/><path d="M18.2 17.2A8 8 0 1 1 20 12"/></svg>',
   desktop:'<svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="4" width="18" height="12.5" rx="2"/><path d="M9 20h6m-3-3.5V20"/></svg>',
@@ -1323,7 +1327,8 @@
       }
       return result;
     };
-    const matches = { input:lastMatch(INPUT_REQUIRED_PATTERN), active:lastMatch(CODEX_ACTIVE_PATTERN), complete:lastMatch(CODEX_COMPLETE_PATTERN), idle:lastMatch(CODEX_IDLE_PATTERN) };
+    const hasCodexInputPrompt = CODEX_APPROVAL_MENU_PATTERN.test(text) || CODEX_QUESTION_PATTERN.test(text);
+    const matches = { input:hasCodexInputPrompt ? lastMatch(INPUT_REQUIRED_PATTERN) : { index:-1, text:'' }, active:lastMatch(CODEX_ACTIVE_PATTERN), complete:lastMatch(CODEX_COMPLETE_PATTERN), idle:lastMatch(CODEX_IDLE_PATTERN) };
     const indexes = Object.fromEntries(Object.entries(matches).map(([name, match]) => [name, match.index]));
     const latest = Math.max(...Object.values(indexes));
     if (latest < 0) return { inputRequired:false, codexActive:false, codexCompleted:false, codexIdle:false, completionKey:'' };

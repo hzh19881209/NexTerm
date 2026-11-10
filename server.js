@@ -1749,7 +1749,13 @@ function rememberOutput(session, data) {
 const CODEX_ACTIVE_RE = /(?:^|\n)\s*[•●]\s+.+\(\s*\d+(?:s|m|h).*?esc\s+to\s+interr/i;
 const CODEX_IDLE_RE = /(?:^|\n)\s*›\s*Ask Codex to do anything\s*(?:\n|$)/i;
 const CODEX_COMPLETE_RE = /(?:^|\n)\s*[─━-]+\s*Worked for\s+\d[^\n]*/i;
-const INPUT_REQUIRED_RE = /(?:Would you like to (?:run|apply|execute)|Press enter to confirm or esc to|Question\s+\d+\/\d+\s+\(\d+\s+unanswered\)|enter to submit answer|needs your approval|Approval requested|main needs input|请确认|需要确认|是否继续(?:执行)?|等待(?:用户)?确认)/i;
+// A real Codex prompt always carries its structured menu or question UI.
+// Ordinary command output can legitimately contain "请确认" / "等待确认" (for
+// example, GitHub release notes), so generic confirmation words must never be
+// enough to start the approval loop.
+const CODEX_APPROVAL_MENU_RE = /(?:^|\n)\s*(?:›\s*)?1\.\s*Yes,\s*proceed\b[\s\S]{0,2000}?(?:(?:^|\n)\s*(?:›\s*)?[23]\.\s*(?:Yes,|No,)|(?:^|\n)\s*Press enter to confirm or esc to cancel)/i;
+const CODEX_QUESTION_RE = /(?:^|\n)\s*Question\s+\d+\/\d+\s+\(\d+\s+unanswered\)[\s\S]{0,2000}?(?:^|\n)\s*enter to submit answer/i;
+const INPUT_REQUIRED_RE = /(?:Would you like to (?:run|apply|execute)|Press enter to confirm or esc to|Question\s+\d+\/\d+\s+\(\d+\s+unanswered\)|enter to submit answer|needs your approval|Approval requested|main needs input)/i;
 const APPROVAL_SETTLE_MS = 450;
 const APPROVAL_STABLE_FRAMES = 2;
 const APPROVAL_MAX_ATTEMPTS = 3;
@@ -1791,7 +1797,9 @@ function lastPatternIndex(text, pattern) {
 // that issued it. Without this the model only sees a truncated tail and has to
 // guess which paths a delete touches.
 function approvalPromptBlock(text) {
-  const lines = String(text || '').split('\n');
+  const screenText = String(text || '');
+  if (!CODEX_APPROVAL_MENU_RE.test(screenText) && !CODEX_QUESTION_RE.test(screenText)) return '';
+  const lines = screenText.split('\n');
   const anchor = lines.reduce((found, line, index) => (INPUT_REQUIRED_RE.test(line) ? index : found), -1);
   if (anchor < 0) return '';
   let start = anchor;
@@ -1812,6 +1820,7 @@ function approvalPromptBlock(text) {
 }
 function sessionPromptState(session) {
   const text = screenTailText(session);
+  if (!CODEX_APPROVAL_MENU_RE.test(text) && !CODEX_QUESTION_RE.test(text)) return { inputRequired:false, screen:text, block:'' };
   const input = lastPatternIndex(text, INPUT_REQUIRED_RE);
   if (input < 0) return { inputRequired:false, screen:text, block:'' };
   const active = lastPatternIndex(text, CODEX_ACTIVE_RE);

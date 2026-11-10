@@ -177,6 +177,35 @@ test('approval prompt block isolates the pending command', async (t) => {
   assert.equal(context.approvalPromptBlock('no prompt here'), '');
 });
 
+// Release scripts print commit messages verbatim. Words like "等待确认" or
+// "请确认" in that output are prose, not a Codex prompt, and must not trigger
+// the model approval loop.
+test('plain release logs with confirmation words are not approval prompts', async (t) => {
+  const serverSource = fs.readFileSync(path.join(__dirname, '../server.js'), 'utf8');
+  const source = serverSource.slice(serverSource.indexOf('function approvalPromptBlock('), serverSource.indexOf('function sessionPromptState('));
+  const regexSource = serverSource.slice(serverSource.indexOf('const CODEX_ACTIVE_RE'), serverSource.indexOf('const APPROVAL_SETTLE_MS'));
+  const context = vm.createContext({ APPROVAL_BLOCK_MAX_LINES:28, APPROVAL_BLOCK_MAX_BYTES:8_000 });
+  vm.runInContext(regexSource, context);
+  vm.runInContext(source, context);
+  const releaseLog = [
+    '仓库：hzh19881209/NexTerm',
+    '版本：26.11.1011   标签：v26.11.1011',
+    '- 新增 Codex 运行状态指示：等待确认时显示琥珀色圆点',
+    '请确认发布内容无误后继续',
+    'Press enter to confirm or esc to cancel'
+  ].join('\n');
+  assert.equal(context.approvalPromptBlock(releaseLog), '');
+  const codexPrompt = [
+    'Would you like to run this command?',
+    '  1. Yes, proceed (y)',
+    "  2. Yes, and don't ask again (p)",
+    '  3. No, and tell Codex what to do differently (esc)',
+    '',
+    '  Press enter to confirm or esc to cancel'
+  ].join('\n');
+  assert.match(context.approvalPromptBlock(codexPrompt), /Would you like to run this command\?/);
+});
+
 // Long one-liners (dependency downloads, installs) must survive the block
 // budget, and the system prompt must let the model approve them when the
 // destination and source are clearly low-risk public locations.
