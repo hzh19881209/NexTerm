@@ -1278,19 +1278,30 @@
     if (!buffer) return false;
     return Number(buffer.viewportY) >= Number(buffer.baseY) + Number(terminal.rows || 0) - 1;
   }
-  // History lives in the NORMAL buffer.  Full-screen TUIs (Codex) switch the
-  // active buffer to the alternate one, which is exactly the screen session
-  // output is appended to afterwards - while the TUI is running the alternate
-  // buffer itself never accumulates scrollback (it is pinned to the viewport),
-  // so judging availability from the active buffer kept the local takeover off
-  // and upward wheel motion was forwarded to the TUI as cursor keys: the
-  // reader could not scroll until the TUI exited.  Judge the normal buffer
-  // instead: it already holds the completed session's output, and when it is
-  // empty (a TUI started from a fresh shell) the wheel is left to the TUI.
+  // Whether scrollback history exists ABOVE the live tail.  baseY stays
+  // elevated after a full-screen TUI has scrolled output off the top, so it
+  // alone can read as "there is history" even when the visible tail sits
+  // directly above the prompt (the scrollback is then just the tail itself,
+  // and scrolling "up" is a no-op - the reader perceives dead scrolling).
+  // A marker registered at the bottom reports the first line of the tail;
+  // only lines below it are real history worth reading.  The marker is kept
+  // alive (xterm unlinks it on dispose) and is re-registered when the
+  // terminal is replaced (reconnect / snapshot restore).
+  const terminalTailMarkers = new WeakMap();
+  function terminalTailMarkerLine(tab) {
+    const terminal = tab?.terminal;
+    if (!terminal) return -1;
+    let marker = terminalTailMarkers.get(tab);
+    if (!marker || marker.dispose) {
+      try { marker = terminal.registerMarker(0); } catch { return -1; }
+      if (marker) terminalTailMarkers.set(tab, marker);
+    }
+    try { return Number(marker.line) || 0; } catch { return -1; }
+  }
   function terminalScrollbackAvailable(tab) {
-    const buffer = tab?.terminal?.buffer?.normal;
+    const buffer = tab?.terminal?.buffer?.active;
     if (!buffer) return false;
-    return Number(buffer.baseY || 0) > 0;
+    return Number(buffer.ybase || 0) > Math.max(0, terminalTailMarkerLine(tab));
   }
   function scrollTerminalToBottom(tab, force = false) {
     if (!tab?.terminal || (!force && tab.followOutput === false)) return;
@@ -1968,7 +1979,7 @@ function closeTab(tabId) { const tab = state.tabs.get(tabId); if (!tab) return; 
           if (!scrollState.momentumPaused) { scrollState.pendingMomentum = 0; return; }
           const amount = Math.round(scrollState.pendingMomentum / 6);
           if (amount) { tab.terminal?.scrollLines?.(-amount); scrollState.pendingMomentum -= amount * 6; }
-          if (scrollState.pendingMomentum && scrollHistoryDepth() > 0) { scheduleMomentum(); return; }
+          if (scrollState.pendingMomentum && Number(tab.terminal?.buffer?.active?.ybase || 0) > Math.max(0, terminalTailMarkerLine(tab))) { scheduleMomentum(); return; }
           // The whole flick cannot be shown: keep the view where it is instead
           // of letting xterm re-clamp it to the tail on the next frame.
           if (scrollState.pendingMomentum && terminalAtBottom(tab)) tab.terminal?.scrollLines?.(-1);
@@ -2012,7 +2023,7 @@ function closeTab(tabId) { const tab = state.tabs.get(tabId); if (!tab) return; 
           // the reader taking control. macOS momentum keeps firing after the
           // gesture ends, so follow must not be re-derived from delta signs.
           tab.followOutput = event.deltaY > 0 && terminalAtBottom(tab);
-          if (event.deltaY < 0 && terminalUsesMouseReporting(tab) && scrollHistoryDepth() <= 0) {
+          if (event.deltaY < 0 && terminalUsesMouseReporting(tab) && terminalScrollbackAvailable(tab) === false) {
             // The TUI owns the viewport and there is no local history left to
             // consume: absorb the rest of the flick instead of letting xterm
             // re-clamp the viewport on the next frame.
