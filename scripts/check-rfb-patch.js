@@ -1,10 +1,12 @@
 // 校验 public/vendor/rfb-bootstrap.js 的 noVNC 补丁完整且语法正确。
 // 用法：node scripts/check-rfb-patch.js
-// 1. 补丁 1：H.264 解码回调 _handleFrame 末尾回收 VideoFrame（frame = {}）；
+// 1. 补丁 1：H.264 pending 包装对象统一通过 _releasePendingFrame 回收 VideoFrame；
 // 2. 补丁 2：断开超时 3 秒放大到 10 秒（var ba=10,）；
 // 3. 补丁 3：渲染队列出队处回收 Image/VideoFrame（e.img&&(e.img=null) 与
 //    typeof e.frame.frame.close=="function"）；
-// 4. ES module 语法解析（优先 esbuild，缺失时回退 node:vm SourceTextModule）。
+// 4. 补丁 4：解码上下文与 Display 渲染队列在断开时全量释放（releaseFrames /
+//    _vncReleaseVideoFrames）；
+// 5. ES module 语法解析（优先 esbuild，缺失时回退 node:vm SourceTextModule）。
 const fs = require('fs');
 const path = require('path');
 const { spawnSync } = require('child_process');
@@ -23,10 +25,9 @@ let changed = false;
 // 必须用 RegExp 查找：esbuild 压缩产物中方法体末尾 "t={}" 恰以 } 结尾，
 // 后续代码若出现 "t={}" 字符串字面量（如 "t={}'"），String.prototype.includes
 // 会命中错误位置，把本来完好的产物误判为损坏。
-// 兼容两种形态：未 minify 时 _handleFrame 以 "frame = {}" 收尾；esbuild
-// minify（生产构建）时该赋值被删，以 "e.keep||t.close()" 收尾后紧跟补丁 4
-// 的 unpinLastFrame 方法（变量名为本构建压缩结果，升级 esbuild 需同步调整）。
-const goodPattern = /frame = \{\}\s*\}\s*_handleError|e\.resolve\(\),e\.keep\|\|t\.close\(\)\}\s*unpinLastFrame/;
+// 兼容源码与 esbuild minify 产物：方法/属性名不会被 esbuild 压缩，因此直接
+// 校验本次修复新增的生命周期方法是否进入产物。
+const goodPattern = /_handleFrame\([^)]*\)\{[\s\S]*?_releasePendingFrame\(/;
 // 历史损坏形态：补丁 1 曾被直接拼接到 minify 产物上，方法体缺少收尾括号
 // （"t={}_handleError" 会把 _handleError 解析成对象字面量属性），整文件
 // SyntaxError，window.RFB 无法挂载。两种变体：无换行 / 补丁时误加换行。
@@ -45,6 +46,13 @@ for (const bad of badPatterns) {
 if (!goodPattern.test(code)) {
   console.error('[check-rfb-patch] 补丁 1 未就位（H.264 VideoFrame 回收缺失），请重新运行 scripts/build-rfb-vendor.js 生成并应用补丁');
   process.exit(1);
+}
+
+for (const required of ['releaseFrames()', '_vncReleaseVideoFrames', '_retainedFrames']) {
+  if (!code.includes(required)) {
+    console.error(`[check-rfb-patch] 补丁 4 未就位（缺少 ${required}），请重新运行 scripts/build-rfb-vendor.js 生成并应用补丁`);
+    process.exit(1);
+  }
 }
 
 // 校验补丁 3 已就位：渲染队列出队处回收 Image / 未关闭的 VideoFrame

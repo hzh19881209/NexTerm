@@ -26,13 +26,14 @@
 //    出队时统一丢弃 Image 引用并关闭其中仍打开的 VideoFrame（与
 //    _scanRenderQ 'frame' 分支的 close 幂等，仅执行一次）；
 // 4. 补丁 1 回收的是"未保留"的帧；decode() 每批最后一条 pending 被标记
-//    keep=true（等下一帧到来时 _handleFrame 再 close 上一帧）。断开/重连
-//    后不会再有新帧，最后一帧被 GC 回收时浏览器报 "VideoFrame was
-//    garbage collected without being closed"。此补丁在打包前修改
-//    core/decoders/h264.js：H264Context 新增 unpinLastFrame() 释放 pending
-//    队列中残留的最后一帧；core/rfb.js 的 RFB 类新增
-//    _vncUnpinVideoFrames() 遍历所有解码上下文调用它，供前端断开时
-//    （disposeVnc）调用。
+//    keep=true，交给 Display 渲染队列绘制后再 close。断开/重连/隐藏页面
+//    时不会再扫描渲染队列，包装对象及其 VideoFrame 会随整棵对象树被 GC，
+//    浏览器随即报 "VideoFrame was garbage collected without being closed"。
+//    旧补丁只从 _pendingFrames 取帧，但解码完成的帧早已被 shift 出该队列，
+//    因此实际没有关到目标帧。此补丁在打包前修改 h264.js / display.js /
+//    rfb.js：每个 pending 包装对象持有幂等 release()，H264Context 跟踪所有
+//    未释放包装对象；Display 新增渲染队列全量释放入口；RFB 的
+//    _vncUnpinVideoFrames() 在断开时同时清理解码上下文与渲染队列。
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
@@ -50,11 +51,10 @@ function clean() {
 }
 
 // 对 esbuild 压缩产物校验/打补丁。
-// 补丁 1、3 已在打包前以源码方式打入 h264.js / display.js，这里校验产物
-// 确实包含补丁语句：
-//   - 补丁 1：_handleFrame 方法体末尾，未 minify 时为 "frame = {}"，
-//     minify 时 "frame = {}" 被删、以 "e.keep||t.close()" 收尾后紧跟
-//     unpinLastFrame（变量名为本构建 esbuild 压缩结果，升级需同步调整）；
+// 补丁 1、3、4 已在打包前以源码方式打入 h264.js / display.js / rfb.js，
+// 这里校验产物确实包含补丁语句：
+//   - 补丁 1：_handleFrame 方法体调用 _releasePendingFrame；
+//   - 补丁 4：H264Context.releaseFrames() 与 Display._vncReleaseVideoFrames；
 //   - 补丁 3：出队处出现 "e.img&&(e.img=null)" 与
 //     'typeof e.frame.frame.close=="function"'（变量名 e 为本构建 esbuild
 //     压缩结果，升级 esbuild 若导致改名需同步调整）。
@@ -65,13 +65,9 @@ function clean() {
 function applyNovncPatches(file) {
   let code = fs.readFileSync(file, 'utf8');
 
-  // 校验补丁 1（H.264 VideoFrame 回收）已进入产物。
-  // 兼容两种形态：
-  //   - 未 minify（开发/调试构建）：方法体以 "frame = {}" 收尾，后接 _handleError；
-  //   - esbuild minify（生产构建）：无读取的 "frame = {}" 赋值会被作为死代码
-  //     删除，"if (!pending.keep) frame.close()" 压缩为 "e.keep||t.close()"，
-  //     此时只需确认 _handleFrame 后紧跟补丁 4 的 unpinLastFrame 方法。
-  const patch1Pattern = /frame = \{\}\s*\}\s*_handleError|e\.keep\|\|t\.close\(\)\}\s*unpinLastFrame/;
+  // 校验补丁 1（H.264 VideoFrame 回收）已进入产物。esbuild 不压缩方法名
+  // 和属性名，因此可直接确认 _handleFrame 内调用了统一释放方法。
+  const patch1Pattern = /_handleFrame\([^)]*\)\{[\s\S]*?_releasePendingFrame\(/;
   if (!patch1Pattern.test(code)) {
     fail('noVNC 补丁 1 未进入产物（H.264 _handleFrame 源码补丁未生效），请检查 core/decoders/h264.js 的锚点');
   }
@@ -84,12 +80,11 @@ function applyNovncPatches(file) {
     fail('noVNC 补丁 3 未进入产物（渲染队列 VideoFrame 回收缺失），请检查 core/display.js 的锚点');
   }
 
-  // 校验补丁 4（断开时释放 H.264 最后一帧）已进入产物。
-  if (!code.includes('unpinLastFrame')) {
-    fail('noVNC 补丁 4 未进入产物（H264Context.unpinLastFrame 源码补丁未生效），请检查 core/decoders/h264.js 的锚点');
-  }
-  if (!code.includes('_vncUnpinVideoFrames')) {
-    fail('noVNC 补丁 4 未进入产物（RFB._vncUnpinVideoFrames 源码补丁未生效），请检查 core/rfb.js 的锚点');
+  // 校验补丁 4（断开时全量释放解码上下文与渲染队列中的帧）已进入产物。
+  for (const required of ['releaseFrames()', '_vncUnpinVideoFrames', '_vncReleaseVideoFrames', '_retainedFrames']) {
+    if (!code.includes(required)) {
+      fail(`noVNC 补丁 4 未进入产物（缺少 ${required}），请检查 core/decoders/h264.js 与 core/display.js 的锚点`);
+    }
   }
 
   // 补丁 2：断开超时 ba 从 3 秒放大到 10 秒。
@@ -134,8 +129,90 @@ try {
   // 才能稳定保留。
   const h264File = path.join(core, 'decoders', 'h264.js');
   let h264Source = fs.readFileSync(h264File, 'utf8');
-  const h264Anchor = '        pending.frame = frame;\n        pending.ready = true;\n        pending.resolve();\n\n        if (!pending.keep) {\n            frame.close();\n        }\n    }';
-  const h264Patched = '        pending.frame = frame;\n        pending.ready = true;\n        pending.resolve();\n\n        if (!pending.keep) {\n            frame.close();\n        }\n        // NexTerm patch: drop the local reference after close so the VideoFrame can be GCed.\n        frame = {};\n    }';
+  const h264StateAnchor = '        this._decoder = null;\n        this._pendingFrames = [];';
+  const h264StatePatched = '        this._decoder = null;\n        this._pendingFrames = [];\n        this._retainedFrames = new Set();';
+  if (!h264Source.includes(h264StateAnchor)) fail('noVNC h264.js 补丁 1 锚点未找到（H264Context 构造函数），请核对 noVNC 版本');
+  h264Source = h264Source.replace(h264StateAnchor, h264StatePatched, 1);
+
+  const h264Anchor = '    _handleFrame(frame) {\n        let pending = this._pendingFrames.shift();\n        if (pending === undefined) {\n            throw new Error("Pending frame queue empty when receiving frame from decoder");\n        }\n\n        if (pending.timestamp != frame.timestamp) {\n            throw new Error("Video frame timestamp mismatch. Expected " +\n                frame.timestamp + " but but got " + pending.timestamp);\n        }\n\n        pending.frame = frame;\n        pending.ready = true;\n        pending.resolve();\n\n        if (!pending.keep) {\n            frame.close();\n        }\n    }';
+  const h264Patched = [
+    '    _handleFrame(frame) {',
+    '        let pending = this._pendingFrames.shift();',
+    '        if (pending === undefined) {',
+    '            // NexTerm patch: a decoder may still emit an output after its',
+    '            // context was reset/released. There is no renderer left to own',
+    '            // this frame, so close it instead of throwing and leaking it.',
+    '            frame.close();',
+    '            return;',
+    '        }',
+    '',
+    '        if (pending.timestamp != frame.timestamp) {',
+    '            frame.close();',
+    '            this._releasePendingFrame(pending);',
+    '            throw new Error("Video frame timestamp mismatch. Expected " +',
+    '                frame.timestamp + " but but got " + pending.timestamp);',
+    '        }',
+    '',
+    '        pending.frame = frame;',
+    '        pending.ready = true;',
+    '        pending.resolve();',
+    '',
+    '        if (!pending.keep) {',
+    '            this._releasePendingFrame(pending);',
+    '        }',
+    '        frame = {};',
+    '    }',
+    '',
+    '    // NexTerm patch: every pending wrapper owns exactly one VideoFrame and',
+    '    // is tracked until released. Display calls release() after drawImage;',
+    '    // teardown calls releaseFrames() for wrappers that never get rendered.',
+    '    _releasePendingFrame(pending) {',
+    '        if (!pending) {',
+    '            return;',
+    '        }',
+    '        const index = this._pendingFrames.indexOf(pending);',
+    '        if (index !== -1) {',
+    '            this._pendingFrames.splice(index, 1);',
+    '        }',
+    '        const frame = pending.frame;',
+    '        pending.frame = null;',
+    '        this._retainedFrames.delete(pending);',
+    '        if (frame && typeof frame.close === "function") {',
+    '            frame.close();',
+    '        }',
+    '        if (!pending.ready && typeof pending.resolve === "function") {',
+    '            pending.ready = true;',
+    '            const resolve = pending.resolve;',
+    '            pending.resolve = () => {};',
+    '            resolve();',
+    '        }',
+    '    }',
+    '',
+    '    releaseFrames(closeDecoder = true) {',
+    '        if (closeDecoder) {',
+    '            this._pendingFrames.length = 0;',
+    '        }',
+    '        for (const pending of Array.from(this._retainedFrames)) {',
+    '            if (closeDecoder || pending.ready) {',
+    '                this._releasePendingFrame(pending);',
+    '            }',
+    '        }',
+    '        if (!closeDecoder) {',
+    '            return;',
+    '        }',
+    '        this._retainedFrames.clear();',
+    '        if (this._decoder !== null) {',
+    '            try {',
+    '                if (this._decoder.state !== "closed") {',
+    '                    this._decoder.close();',
+    '                }',
+    '            } catch (e) {',
+    '                // The decoder may have already been closed by the browser.',
+    '            }',
+    '            this._decoder = null;',
+    '        }',
+    '    }',
+  ].join('\n');
   if (!h264Source.includes(h264Anchor)) fail('noVNC h264.js 补丁 1 锚点未找到（_handleFrame），请核对 noVNC 版本');
   h264Source = h264Source.replace(h264Anchor, h264Patched, 1);
   fs.writeFileSync(h264File, h264Source);
@@ -149,6 +226,84 @@ try {
   //    队列里的帧从未被 close，这里兜底。
   const displayFile = path.join(core, 'display.js');
   let displaySource = fs.readFileSync(displayFile, 'utf8');
+  const displayFrameAnchor = '                case \'frame\':\n                    if (a.frame.ready) {\n                        // The encoded frame may be larger than the rect due to\n                        // limitations of the encoder, so we need to crop the\n                        // frame.\n                        let frame = a.frame.frame;\n                        if (frame.codedWidth < a.width || frame.codedHeight < a.height) {\n                            Log.Warn("Decoded video frame does not cover its full rectangle area. Expecting at least " +\n                                      a.width + "x" + a.height + " but got " +\n                                      frame.codedWidth + "x" + frame.codedHeight);\n                        }\n                        const sx = 0;\n                        const sy = 0;\n                        const sw = a.width;\n                        const sh = a.height;\n                        const dx = a.x;\n                        const dy = a.y;\n                        const dw = sw;\n                        const dh = sh;\n                        this.drawImage(frame, sx, sy, sw, sh, dx, dy, dw, dh);\n                        frame.close();\n                    } else {\n                        let display = this;\n                        a.frame.promise.then(() => {\n                            display._scanRenderQ();\n                        });\n                        ready = false;\n                    }\n                    break;';
+  const displayFramePatched = [
+    '                case \'frame\':',
+    '                    // NexTerm patch: teardown may have released this action',
+    '                    // already (frame is null); skip it without drawing a',
+    '                    // closed VideoFrame.',
+    '                    if (!a.frame || !a.frame.frame) {',
+    '                        break;',
+    '                    }',
+    '                    if (a.frame.ready) {',
+    '                        // The encoded frame may be larger than the rect due to',
+    '                        // limitations of the encoder, so we need to crop the',
+    '                        // frame.',
+    '                        let frame = a.frame.frame;',
+    '                        try {',
+    '                            if (frame.codedWidth < a.width || frame.codedHeight < a.height) {',
+    '                                Log.Warn("Decoded video frame does not cover its full rectangle area. Expecting at least " +',
+    '                                          a.width + "x" + a.height + " but got " +',
+    '                                          frame.codedWidth + "x" + frame.codedHeight);',
+    '                            }',
+    '                            const sx = 0;',
+    '                            const sy = 0;',
+    '                            const sw = a.width;',
+    '                            const sh = a.height;',
+    '                            const dx = a.x;',
+    '                            const dy = a.y;',
+    '                            const dw = sw;',
+    '                            const dh = sh;',
+    '                            this.drawImage(frame, sx, sy, sw, sh, dx, dy, dw, dh);',
+    '                        } finally {',
+    '                            // Always release, even if drawImage throws; the',
+    '                            // pending wrapper is idempotent.',
+    '                            if (typeof a.frame.release === "function") {',
+    '                                a.frame.release();',
+    '                            } else {',
+    '                                frame.close();',
+    '                                a.frame.frame = null;',
+    '                            }',
+    '                        }',
+    '                    } else {',
+    '                        let display = this;',
+    '                        a.frame.promise.then(() => {',
+    '                            display._scanRenderQ();',
+    '                        });',
+    '                        ready = false;',
+    '                    }',
+    '                    break;',
+  ].join('\n');
+  if (!displaySource.includes(displayFrameAnchor)) fail('noVNC display.js 补丁 3 锚点未找到（frame 渲染分支），请核对 noVNC 版本');
+  displaySource = displaySource.replace(displayFrameAnchor, displayFramePatched, 1);
+
+  const displayReleaseAnchor = '    _renderQPush(action) {';
+  const displayReleasePatched = [
+    '    // NexTerm patch: close every VideoFrame still held by queued actions.',
+    '    // This is called during teardown, when no further _scanRenderQ will run.',
+    '    _vncReleaseVideoFrames(closeAll = true) {',
+    '        for (const action of this._renderQ) {',
+    '            if (action.type !== "frame" || !action.frame) {',
+    '                continue;',
+    '            }',
+    '            if (!closeAll && !action.frame.ready) {',
+    '                continue;',
+    '            }',
+    '            if (typeof action.frame.release === "function") {',
+    '                action.frame.release();',
+    '            } else if (action.frame.frame &&',
+    '                       typeof action.frame.frame.close === "function") {',
+    '                action.frame.frame.close();',
+    '                action.frame.frame = null;',
+    '            }',
+    '        }',
+    '    }',
+    '',
+    '    _renderQPush(action) {',
+  ].join('\n');
+  if (!displaySource.includes(displayReleaseAnchor)) fail('noVNC display.js 补丁 3 锚点未找到（_renderQPush），请核对 noVNC 版本');
+  displaySource = displaySource.replace(displayReleaseAnchor, displayReleasePatched, 1);
+
   const displayAnchor = '            if (ready) {\n                this._renderQ.shift();\n            }';
   const displayPatched = [
     '            if (ready) {',
@@ -171,58 +326,81 @@ try {
   displaySource = displaySource.replace(displayAnchor, displayPatched, 1);
   fs.writeFileSync(displayFile, displaySource);
 
-  // 补丁 4：H264Context 新增 unpinLastFrame()。decode() 每批最后一条
-  // pending 被 keep=true 保留（等下一帧到来时 _handleFrame 再 close 上一
-  // 帧），断开后不会再有新帧，残留 VideoFrame 被 GC 时浏览器报
-  // "VideoFrame was garbage collected without being closed"。这里取出
-  // pending 队列中残留的最后一帧并 close；若帧未到达（ready=false）则
-  // 丢弃 promise 的 resolve，避免后续回调访问已释放对象。
-  const h264Anchor2 = '            frame.close();\n        }\n        // NexTerm patch: drop the local reference after close so the VideoFrame can be GCed.\n        frame = {};\n    }';
-  const h264Patched2 = [
-    '            frame.close();',
+  const h264PrepareAnchor = '        this._pendingFrames.push(pending);\n\n        return pending;';
+  const h264PreparePatched = [
+    '        pending.release = () => this._releasePendingFrame(pending);',
+    '        this._pendingFrames.push(pending);',
+    '        this._retainedFrames.add(pending);',
+    '',
+    '        return pending;',
+  ].join('\n');
+  if (!h264Source.includes(h264PrepareAnchor)) fail('noVNC h264.js 补丁 4 锚点未找到（_preparePendingFrame），请核对 noVNC 版本');
+  h264Source = h264Source.replace(h264PrepareAnchor, h264PreparePatched, 1);
+
+  // 补丁 4：decode() 每批最后一条 pending 被 keep=true 交给 Display 渲染。
+  // 解码完成后它已经不在 _pendingFrames 中，旧版 unpinLastFrame 因此取不到
+  // 真正持有的帧。这里给每个 pending 记录 release()，并在重置上下文/断开
+  // 时通过 H264Context.releaseFrames() 全量释放。
+
+  const h264CreateAnchor = '        if (Object.keys(this._contexts).length >= maxContexts) {\n            let oldestContextId = this._findOldestContextId();\n            delete this._contexts[oldestContextId];\n        }';
+  const h264CreatePatched = [
+    '        if (Object.keys(this._contexts).length >= maxContexts) {',
+    '            let oldestContextId = this._findOldestContextId();',
+    '            const oldestContext = this._contexts[oldestContextId];',
+    '            if (oldestContext && typeof oldestContext.releaseFrames === "function") {',
+    '                oldestContext.releaseFrames();',
+    '            }',
+    '            delete this._contexts[oldestContextId];',
     '        }',
+  ].join('\n');
+  if (!h264Source.includes(h264CreateAnchor)) fail('noVNC h264.js 补丁 4 锚点未找到（_createContext 淘汰），请核对 noVNC 版本');
+  h264Source = h264Source.replace(h264CreateAnchor, h264CreatePatched, 1);
+
+  const h264ResetAnchor = '    _resetContext(x, y, width, height) {\n        delete this._contexts[this._contextId(x, y, width, height)];\n    }\n\n    _resetAllContexts() {\n        this._contexts = {};\n    }';
+  const h264ResetPatched = [
+    '    _resetContext(x, y, width, height) {',
+    '        const id = this._contextId(x, y, width, height);',
+    '        const context = this._contexts[id];',
+    '        if (context && typeof context.releaseFrames === "function") {',
+    '            context.releaseFrames();',
+    '        }',
+    '        delete this._contexts[id];',
     '    }',
     '',
-    '    // NexTerm patch: release the last kept frame (keep=true) so it is',
-    '    // not GCed while still open after the connection goes away.',
-    '    unpinLastFrame() {',
-    '        const pending = this._pendingFrames.shift();',
-    '        if (pending === undefined) {',
-    '            return;',
+    '    _resetAllContexts() {',
+    '        for (const context of Object.values(this._contexts)) {',
+    '            if (context && typeof context.releaseFrames === "function") {',
+    '                context.releaseFrames();',
+    '            }',
     '        }',
-    "        if (pending.frame && typeof pending.frame.close === 'function') {",
-    '            pending.frame.close();',
-    '        }',
-    '        if (!pending.ready) {',
-    '            pending.resolve = () => {};',
-    '        }',
-    '        pending.frame = null;',
+    '        this._contexts = {};',
     '    }',
   ].join('\n');
-  if (!h264Source.includes(h264Anchor2)) fail('noVNC h264.js 补丁 4 锚点未找到（_handleFrame 收尾），请核对 noVNC 版本');
-  h264Source = h264Source.replace(h264Anchor2, h264Patched2, 1);
+  if (!h264Source.includes(h264ResetAnchor)) fail('noVNC h264.js 补丁 4 锚点未找到（上下文重置），请核对 noVNC 版本');
+  h264Source = h264Source.replace(h264ResetAnchor, h264ResetPatched, 1);
   fs.writeFileSync(h264File, h264Source);
 
   // 补丁 4（续）：RFB 类新增 _vncUnpinVideoFrames()，遍历所有 H.264 解码
-  // 上下文（_contexts 按 (x,y,w,h) 键控，最多 64 个）释放各自最后一帧，
-  // 供前端断开 VNC（disposeVnc）时调用。
+  // 上下文释放其跟踪的全部 pending/VideoFrame，并清空 Display 渲染队列
+  // 中尚未绘制的帧。只释放解码队列会漏掉已出队、正等待渲染的最后一帧。
   const rfbFile = path.join(core, 'rfb.js');
   let rfbSource = fs.readFileSync(rfbFile, 'utf8');
   const rfbAnchor = '    static genDES(password, challenge) {';
   const rfbPatched = [
-    '    // NexTerm patch: close the last pending H.264 VideoFrame in every',
-    '    // decode context on disconnect; without this the frames are only',
-    '    // released when the next frame arrives, which never happens after',
-    '    // the connection ends.',
-    '    _vncUnpinVideoFrames() {',
+    '    // NexTerm patch: release every retained H.264 VideoFrame on teardown.',
+    '    // Completed frames live in Display._renderQ, not in _pendingFrames, so',
+    '    // both sides must be drained to avoid GC warnings and stalled decoders.',
+    '    _vncUnpinVideoFrames(closeDecoder = true) {',
     '        const decoder = this._decoders && this._decoders[encodings.encodingH264];',
-    '        if (!decoder) {',
-    '            return;',
-    '        }',
-    '        for (const context of Object.values(decoder._contexts || {})) {',
-    "            if (typeof context.unpinLastFrame === 'function') {",
-    '                context.unpinLastFrame();',
+    '        if (decoder) {',
+    '            for (const context of Object.values(decoder._contexts || {})) {',
+    '                if (context && typeof context.releaseFrames === "function") {',
+    '                    context.releaseFrames(closeDecoder);',
+    '                }',
     '            }',
+    '        }',
+    '        if (this._display && typeof this._display._vncReleaseVideoFrames === "function") {',
+    '            this._display._vncReleaseVideoFrames(closeDecoder);',
     '        }',
     '    }',
     '',

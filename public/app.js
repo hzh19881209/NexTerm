@@ -1704,11 +1704,11 @@ function closeTab(tabId) { const tab = state.tabs.get(tabId); if (!tab) return; 
       // 收尾：立即转到 disconnected（clean 保持 true、不弹误报通知），并清除
       // _disconnTimer，从根上消除该超时日志。
       rfb.disconnect();
-      // noVNC 的 H.264 解码器会把最后一帧标记为 keep（等下一帧到来才
-      // close 上一帧）；断开后不会再有新帧，残留 VideoFrame 被 GC 回收时
-      // 浏览器会报 "VideoFrame was garbage collected without being
-      // closed"。这里主动释放各解码上下文的最后一帧。
-      rfb._vncUnpinVideoFrames?.();
+      // noVNC 的 H.264 解码器每批最后一帧会交给 Display 渲染队列；
+      // 断开后不再扫描队列，残留 VideoFrame 被 GC 回收时浏览器会报
+      // "VideoFrame was garbage collected without being closed"。这里在
+      // 断开时同时清理解码上下文和渲染队列中的待绘制帧。
+      rfb._vncUnpinVideoFrames?.(true);
       rfb._socketClose({ code: 1000 });
     } catch { /* already closed */ }
   }
@@ -2828,8 +2828,10 @@ function closeTab(tabId) { const tab = state.tabs.get(tabId); if (!tab) return; 
   document.addEventListener('visibilitychange', () => { if (!document.hidden) { updateAttentionTitle(); resumeSessions(); } });
   window.addEventListener('focus', resumeSessions);
   window.addEventListener('online', resumeSessions);
-  const releaseVncFrames = () => { state.tabs.forEach((tab) => { try { tab?.vnc?.rfb?._vncUnpinVideoFrames?.(); } catch { /* ignore */ } }); };
-  document.addEventListener('visibilitychange', () => { if (document.hidden) releaseVncFrames(); });
-  window.addEventListener('pagehide', releaseVncFrames);
+  const releaseVncFrames = (closeDecoder = false) => { state.tabs.forEach((tab) => { try { tab?.vnc?.rfb?._vncUnpinVideoFrames?.(closeDecoder); } catch { /* ignore */ } }); };
+  // 后台只释放已经解码完成的帧，保留 VideoDecoder 继续处理在途数据；关页
+  // 或断开时才关闭解码器，避免恢复后因缺少关键帧而停住。
+  document.addEventListener('visibilitychange', () => { if (document.hidden) releaseVncFrames(false); });
+  window.addEventListener('pagehide', () => releaseVncFrames(true));
   api('/api/auth/me').then((result) => { if (result.user.mustChangePassword) renderChangePassword(); else return loadWorkspace(); }).catch(() => renderLogin());
 })();
