@@ -1693,6 +1693,11 @@ function closeTab(tabId) { const tab = state.tabs.get(tabId); if (!tab) return; 
       // 收尾：立即转到 disconnected（clean 保持 true、不弹误报通知），并清除
       // _disconnTimer，从根上消除该超时日志。
       rfb.disconnect();
+      // noVNC 的 H.264 解码器会把最后一帧标记为 keep（等下一帧到来才
+      // close 上一帧）；断开后不会再有新帧，残留 VideoFrame 被 GC 回收时
+      // 浏览器会报 "VideoFrame was garbage collected without being
+      // closed"。这里主动释放各解码上下文的最后一帧。
+      rfb._vncUnpinVideoFrames?.();
       rfb._socketClose({ code: 1000 });
     } catch { /* already closed */ }
   }
@@ -1809,14 +1814,6 @@ function closeTab(tabId) { const tab = state.tabs.get(tabId); if (!tab) return; 
       if (!isCurrent()) { try { ws.close(); } catch { /* ignore */ } return; }
       const handle = (raw) => {
         if (!isCurrent()) return;
-        // 诊断：跟踪 RFB 状态机变化，定位握手卡点
-        const r = rfb;
-        const key = (r._rfbConnectionState || '') + '|' + (r._rfbInitState || '');
-        if (handle._lastState !== key) {
-          handle._lastState = key;
-          const disp = r._display ? (r._display.width + 'x' + r._display.height) : '?';
-          console.info('[nexterm-vnc] RFB 状态:', key, 'display:', disp);
-        }
         if (typeof raw !== 'string' || raw.length > 512 * 1024) return;
         let message; try { message = JSON.parse(raw); } catch { return; }
         if (!message || message.type !== 'vnc-data' || typeof message.data !== 'string') return;
@@ -1827,42 +1824,14 @@ function closeTab(tabId) { const tab = state.tabs.get(tabId); if (!tab) return; 
         // 通道（惰性通道未 arm 就被访问），直接忽略本帧。
         // 注意：握手期间 noVNC 会持续向发送队列写入协议帧（版本/安全/
         // 认证应答），_sQlen 常态非空，不能作为废弃判据。
-        if (!sock || sock.readyState !== 'open' || !sock._sQ) {
-          handle._guardSkips = (handle._guardSkips || 0) + 1;
-          if (handle._guardSkips <= 3) console.warn('[nexterm-vnc] 守卫拦截 vnc-data（sock=' + Boolean(sock) + ' rs=' + (sock && sock.readyState) + ' sQ=' + Boolean(sock && sock._sQ) + '）');
-          return;
-        }
-        handle._pushes = (handle._pushes || 0) + 1;
+        if (!sock || sock.readyState !== 'open' || !sock._sQ) return;
         try {
           // 通过 noVNC 自己的接收入口入队：它会处理队列压缩/扩容并触发
           // message handler。直接递增 _rQlen 会绕过这些逻辑，长时间运行
           // 后接收缓冲区会持续膨胀。
           sock._recvMessage({ data: bytes.buffer });
-          if (handle._pushes <= 5) console.info('[nexterm-vnc] 推入 rQ #'+handle._pushes+' ('+bytes.length+'B) 首字节='+(bytes[0]||0)+' 状态='+rfb._rfbConnectionState+'|'+rfb._rfbInitState);
         } catch (pushError) {
-          console.error('[nexterm-vnc] 推入 RFB 字节失败:', pushError,
-            'rfbState=' + rfb._rfbConnectionState,
-            'sockRS=' + sock.readyState,
-            'rQlen=' + sock._rQlen);
-        }
-        // 诊断：记录 noVNC 发出的字节（拦截 sQpushString）
-        if (!handle._patchedSQ) {
-          handle._patchedSQ = true;
-          const origPushString = sock.sQpushString.bind(sock);
-          sock.sQpushString = (str) => {
-            if (handle._sends <= 5) console.info('[nexterm-vnc] sQpushString: '+JSON.stringify(str)+' ('+str.length+'B) 状态='+rfb._rfbConnectionState+'|'+rfb._rfbInitState);
-            handle._sends = (handle._sends || 0) + 1;
-            return origPushString(str);
-          };
-          const origFlush = sock.flush.bind(sock);
-          sock.flush = () => {
-            if (sock._sQlen > 0 && sock.readyState === 'open') {
-              const data = new Uint8Array(sock._sQ.buffer, 0, sock._sQlen);
-              if (handle._flushes <= 5) console.info('[nexterm-vnc] flush 发送 '+data.length+'B: '+Array.from(data.slice(0,20)).map(b=>b.toString(16)).join(' ')+' 状态='+rfb._rfbConnectionState+'|'+rfb._rfbInitState);
-              handle._flushes = (handle._flushes || 0) + 1;
-            }
-            return origFlush();
-          };
+          console.error('[nexterm-vnc] 推入 RFB 字节失败:', pushError);
         }
       };
       ws.binaryType = 'arraybuffer';
