@@ -8,7 +8,7 @@
 // 该文件被 .gitignore 忽略（public/vendor/ 整个目录不入库），每次构建前由
 // copy-vendor.js 调用本脚本重新生成。需要网络访问 codeload.github.com（GitHub 官方 tarball 分发地址，国内直连更稳定）。
 
-// 对 noVNC 打三个补丁（补丁 1、3 打包前改源码，补丁 2 压缩产物 token 替换）：
+// 对 noVNC 打四个补丁（补丁 1、3、4 打包前改源码，补丁 2 压缩产物 token 替换）：
 // 1. noVNC v1.6.0 的 H.264 解码器从不回收 VideoFrame，浏览器会反复打印
 //    "A VideoFrame was garbage collected without being closed"，长时间
 //    连接可能造成卡顿。此补丁在打包前直接修改 core/decoders/h264.js 源码
@@ -24,7 +24,15 @@
 //    表现为浏览器控制台 "VideoFrame/Image was garbage collected" 类报错
 //    与内存缓慢爬升。此补丁在打包前修改 core/display.js 源码：渲染动作
 //    出队时统一丢弃 Image 引用并关闭其中仍打开的 VideoFrame（与
-//    _scanRenderQ 'frame' 分支的 close 幂等，仅执行一次）。
+//    _scanRenderQ 'frame' 分支的 close 幂等，仅执行一次）；
+// 4. 补丁 1 回收的是"未保留"的帧；decode() 每批最后一条 pending 被标记
+//    keep=true（等下一帧到来时 _handleFrame 再 close 上一帧）。断开/重连
+//    后不会再有新帧，最后一帧被 GC 回收时浏览器报 "VideoFrame was
+//    garbage collected without being closed"。此补丁在打包前修改
+//    core/decoders/h264.js：H264Context 新增 unpinLastFrame() 释放 pending
+//    队列中残留的最后一帧；core/rfb.js 的 RFB 类新增
+//    _vncUnpinVideoFrames() 遍历所有解码上下文调用它，供前端断开时
+//    （disposeVnc）调用。
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
@@ -44,7 +52,9 @@ function clean() {
 // 对 esbuild 压缩产物校验/打补丁。
 // 补丁 1、3 已在打包前以源码方式打入 h264.js / display.js，这里校验产物
 // 确实包含补丁语句：
-//   - 补丁 1："t={}" 位于 _handleFrame 方法体末尾，后接 _handleError 方法；
+//   - 补丁 1：_handleFrame 方法体末尾，未 minify 时为 "frame = {}"，
+//     minify 时 "frame = {}" 被删、以 "e.keep||t.close()" 收尾后紧跟
+//     unpinLastFrame（变量名为本构建 esbuild 压缩结果，升级需同步调整）；
 //   - 补丁 3：出队处出现 "e.img&&(e.img=null)" 与
 //     'typeof e.frame.frame.close=="function"'（变量名 e 为本构建 esbuild
 //     压缩结果，升级 esbuild 若导致改名需同步调整）。
@@ -56,7 +66,12 @@ function applyNovncPatches(file) {
   let code = fs.readFileSync(file, 'utf8');
 
   // 校验补丁 1（H.264 VideoFrame 回收）已进入产物。
-  const patch1Pattern = /t=\{\}\}\s*_handleError/;
+  // 兼容两种形态：
+  //   - 未 minify（开发/调试构建）：方法体以 "frame = {}" 收尾，后接 _handleError；
+  //   - esbuild minify（生产构建）：无读取的 "frame = {}" 赋值会被作为死代码
+  //     删除，"if (!pending.keep) frame.close()" 压缩为 "e.keep||t.close()"，
+  //     此时只需确认 _handleFrame 后紧跟补丁 4 的 unpinLastFrame 方法。
+  const patch1Pattern = /frame = \{\}\s*\}\s*_handleError|e\.keep\|\|t\.close\(\)\}\s*unpinLastFrame/;
   if (!patch1Pattern.test(code)) {
     fail('noVNC 补丁 1 未进入产物（H.264 _handleFrame 源码补丁未生效），请检查 core/decoders/h264.js 的锚点');
   }
@@ -67,6 +82,14 @@ function applyNovncPatches(file) {
   }
   if (!code.includes('typeof e.frame.frame.close=="function"')) {
     fail('noVNC 补丁 3 未进入产物（渲染队列 VideoFrame 回收缺失），请检查 core/display.js 的锚点');
+  }
+
+  // 校验补丁 4（断开时释放 H.264 最后一帧）已进入产物。
+  if (!code.includes('unpinLastFrame')) {
+    fail('noVNC 补丁 4 未进入产物（H264Context.unpinLastFrame 源码补丁未生效），请检查 core/decoders/h264.js 的锚点');
+  }
+  if (!code.includes('_vncUnpinVideoFrames')) {
+    fail('noVNC 补丁 4 未进入产物（RFB._vncUnpinVideoFrames 源码补丁未生效），请检查 core/rfb.js 的锚点');
   }
 
   // 补丁 2：断开超时 ba 从 3 秒放大到 10 秒。
@@ -147,6 +170,67 @@ try {
   if (!displaySource.includes(displayAnchor)) fail('noVNC display.js 补丁 3 锚点未找到（_scanRenderQ 出队处），请核对 noVNC 版本');
   displaySource = displaySource.replace(displayAnchor, displayPatched, 1);
   fs.writeFileSync(displayFile, displaySource);
+
+  // 补丁 4：H264Context 新增 unpinLastFrame()。decode() 每批最后一条
+  // pending 被 keep=true 保留（等下一帧到来时 _handleFrame 再 close 上一
+  // 帧），断开后不会再有新帧，残留 VideoFrame 被 GC 时浏览器报
+  // "VideoFrame was garbage collected without being closed"。这里取出
+  // pending 队列中残留的最后一帧并 close；若帧未到达（ready=false）则
+  // 丢弃 promise 的 resolve，避免后续回调访问已释放对象。
+  const h264Anchor2 = '            frame.close();\n        }\n        // NexTerm patch: drop the local reference after close so the VideoFrame can be GCed.\n        frame = {};\n    }';
+  const h264Patched2 = [
+    '            frame.close();',
+    '        }',
+    '    }',
+    '',
+    '    // NexTerm patch: release the last kept frame (keep=true) so it is',
+    '    // not GCed while still open after the connection goes away.',
+    '    unpinLastFrame() {',
+    '        const pending = this._pendingFrames.shift();',
+    '        if (pending === undefined) {',
+    '            return;',
+    '        }',
+    "        if (pending.frame && typeof pending.frame.close === 'function') {",
+    '            pending.frame.close();',
+    '        }',
+    '        if (!pending.ready) {',
+    '            pending.resolve = () => {};',
+    '        }',
+    '        pending.frame = null;',
+    '    }',
+  ].join('\n');
+  if (!h264Source.includes(h264Anchor2)) fail('noVNC h264.js 补丁 4 锚点未找到（_handleFrame 收尾），请核对 noVNC 版本');
+  h264Source = h264Source.replace(h264Anchor2, h264Patched2, 1);
+  fs.writeFileSync(h264File, h264Source);
+
+  // 补丁 4（续）：RFB 类新增 _vncUnpinVideoFrames()，遍历所有 H.264 解码
+  // 上下文（_contexts 按 (x,y,w,h) 键控，最多 64 个）释放各自最后一帧，
+  // 供前端断开 VNC（disposeVnc）时调用。
+  const rfbFile = path.join(core, 'rfb.js');
+  let rfbSource = fs.readFileSync(rfbFile, 'utf8');
+  const rfbAnchor = '    static genDES(password, challenge) {';
+  const rfbPatched = [
+    '    // NexTerm patch: close the last pending H.264 VideoFrame in every',
+    '    // decode context on disconnect; without this the frames are only',
+    '    // released when the next frame arrives, which never happens after',
+    '    // the connection ends.',
+    '    _vncUnpinVideoFrames() {',
+    '        const decoder = this._decoders && this._decoders[encodings.encodingH264];',
+    '        if (!decoder) {',
+    '            return;',
+    '        }',
+    '        for (const context of Object.values(decoder._contexts || {})) {',
+    "            if (typeof context.unpinLastFrame === 'function') {",
+    '                context.unpinLastFrame();',
+    '            }',
+    '        }',
+    '    }',
+    '',
+    '    static genDES(password, challenge) {',
+  ].join('\n');
+  if (!rfbSource.includes(rfbAnchor)) fail('noVNC rfb.js 补丁 4 锚点未找到（static genDES），请核对 noVNC 版本');
+  rfbSource = rfbSource.replace(rfbAnchor, rfbPatched, 1);
+  fs.writeFileSync(rfbFile, rfbSource);
 
   const entry = path.join(tmp, 'rfb-entry.js');
   fs.writeFileSync(entry, `import RFB from '${core.replace(/\\/g, '/')}/rfb.js';\nwindow.RFB = RFB;\n`);

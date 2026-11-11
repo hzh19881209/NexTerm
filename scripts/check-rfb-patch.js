@@ -23,7 +23,10 @@ let changed = false;
 // 必须用 RegExp 查找：esbuild 压缩产物中方法体末尾 "t={}" 恰以 } 结尾，
 // 后续代码若出现 "t={}" 字符串字面量（如 "t={}'"），String.prototype.includes
 // 会命中错误位置，把本来完好的产物误判为损坏。
-const goodPattern = /e\.resolve\(\),e\.keep\|\|t\.close\(\),t=\{\}\}\s*_handleError/;
+// 兼容两种形态：未 minify 时 _handleFrame 以 "frame = {}" 收尾；esbuild
+// minify（生产构建）时该赋值被删，以 "e.keep||t.close()" 收尾后紧跟补丁 4
+// 的 unpinLastFrame 方法（变量名为本构建压缩结果，升级 esbuild 需同步调整）。
+const goodPattern = /frame = \{\}\s*\}\s*_handleError|e\.resolve\(\),e\.keep\|\|t\.close\(\)\}\s*unpinLastFrame/;
 // 历史损坏形态：补丁 1 曾被直接拼接到 minify 产物上，方法体缺少收尾括号
 // （"t={}_handleError" 会把 _handleError 解析成对象字面量属性），整文件
 // SyntaxError，window.RFB 无法挂载。两种变体：无换行 / 补丁时误加换行。
