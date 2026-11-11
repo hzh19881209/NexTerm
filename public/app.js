@@ -2817,5 +2817,8 @@ function closeTab(tabId) { const tab = state.tabs.get(tabId); if (!tab) return; 
   document.addEventListener('visibilitychange', () => { if (!document.hidden) { updateAttentionTitle(); resumeSessions(); } });
   window.addEventListener('focus', resumeSessions);
   window.addEventListener('online', resumeSessions);
+  const releaseVncFrames = () => { state.tabs.forEach((tab) => { try { tab?.vnc?.rfb?._vncUnpinVideoFrames?.(); } catch { /* ignore */ } }); };
+  document.addEventListener('visibilitychange', () => { if (document.hidden) releaseVncFrames(); });
+  window.addEventListener('pagehide', releaseVncFrames);
   api('/api/auth/me').then((result) => { if (result.user.mustChangePassword) renderChangePassword(); else return loadWorkspace(); }).catch(() => renderLogin());
 })();
