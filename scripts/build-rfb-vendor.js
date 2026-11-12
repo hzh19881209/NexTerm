@@ -80,6 +80,12 @@ function applyNovncPatches(file) {
     fail('noVNC 补丁 3 未进入产物（渲染队列 VideoFrame 回收缺失），请检查 core/display.js 的锚点');
   }
 
+  // 校验补丁 3b（img 尺寸不匹配不再 return 卡死队列）已进入产物：该分支的
+  // 错误文案带 "(dropping)" 后缀，minify 后字符串字面量保留。
+  if (!code.includes('(dropping)')) {
+    fail('noVNC 补丁 3b 未进入产物（img 尺寸不匹配仍会卡死渲染队列），请检查 core/display.js 的锚点');
+  }
+
   // 校验补丁 4（断开时全量释放解码上下文与渲染队列中的帧）已进入产物。
   for (const required of ['releaseFrames()', '_vncUnpinVideoFrames', '_vncReleaseVideoFrames', '_retainedFrames']) {
     if (!code.includes(required)) {
@@ -276,6 +282,38 @@ try {
   ].join('\n');
   if (!displaySource.includes(displayFrameAnchor)) fail('noVNC display.js 补丁 3 锚点未找到（frame 渲染分支），请核对 noVNC 版本');
   displaySource = displaySource.replace(displayFrameAnchor, displayFramePatched, 1);
+
+  // 补丁 3b：_scanRenderQ 的 'img' 分支在 tight/jpeg 解码图尺寸与协议头声明
+  // 尺寸不一致时直接 return，会永久卡死渲染队列头。videoFrame 与 image 共用
+  // 同一个 _renderQ，队列头一旦被 img 卡住，其后所有 frame 动作（持有
+  // VideoFrame）既不出队也不 close()，只能等 GC，浏览器随即报
+  // "A VideoFrame was garbage collected without being closed"。Windows 远程
+  // 桌面 tightjpeg 的 JPEG 以 8x8 块对齐、常与声明尺寸差几像素，因此这是
+  // 正常运行中（非断开）触发的真实泄漏路径，之前的断开/隐藏/重连释放补丁
+  // 都够不到这里。改为记录错误后丢弃该 img 动作并继续扫描，不再阻塞后续帧。
+  const displayImgAnchor = '                case \'img\':\n                    if (a.img.complete) {\n                        if (a.img.width !== a.width || a.img.height !== a.height) {\n                            Log.Error("Decoded image has incorrect dimensions. Got " +\n                                      a.img.width + "x" + a.img.height + ". Expected " +\n                                      a.width + "x" + a.height + ".");\n                            return;\n                        }\n                        this.drawImage(a.img, a.x, a.y);';
+  const displayImgPatched = [
+    '                case \'img\':',
+    '                    if (a.img.complete) {',
+    '                        if (a.img.width !== a.width || a.img.height !== a.height) {',
+    '                            // NexTerm patch: do NOT return here. Returning',
+    '                            // wedges the whole render queue (videoFrame and',
+    '                            // image actions share _renderQ), so every H.264',
+    '                            // frame queued behind it is never drawn nor',
+    '                            // closed and is eventually GC\'d, which the',
+    '                            // browser reports as "A VideoFrame was garbage',
+    '                            // collected without being closed". Drop this one',
+    '                            // bad image (shift it out below via ready=true)',
+    '                            // and keep scanning the rest of the queue.',
+    '                            Log.Error("Decoded image has incorrect dimensions. Got " +',
+    '                                      a.img.width + "x" + a.img.height + ". Expected " +',
+    '                                      a.width + "x" + a.height + ". (dropping)");',
+    '                        } else {',
+    '                            this.drawImage(a.img, a.x, a.y);',
+    '                        }',
+  ].join('\n');
+  if (!displaySource.includes(displayImgAnchor)) fail('noVNC display.js 补丁 3b 锚点未找到（img 渲染分支 return），请核对 noVNC 版本');
+  displaySource = displaySource.replace(displayImgAnchor, displayImgPatched, 1);
 
   const displayReleaseAnchor = '    _renderQPush(action) {';
   const displayReleasePatched = [

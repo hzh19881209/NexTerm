@@ -55,13 +55,22 @@ for (const required of ['releaseFrames()', '_vncReleaseVideoFrames', '_retainedF
   }
 }
 
-// 校验补丁 3 已就位：渲染队列出队处回收 Image / 未关闭的 VideoFrame
-if (!code.includes('e.img&&(e.img=null)')) {
+// 校验补丁 3 已就位：渲染队列出队处回收 Image / 未关闭的 VideoFrame。
+// esbuild 压缩变量名不固定（可能是 a./e./t. 等），用不依赖变量名的特征片段判断，
+// 避免升级 esbuild 后因改名而误判“补丁未就位”。
+if (!/\.img&&\(.*?\.img=null\)/.test(code)) {
   console.error('[check-rfb-patch] 补丁 3 未就位（渲染队列 Image 回收缺失），请重新运行 scripts/build-rfb-vendor.js 生成并应用补丁');
   process.exit(1);
 }
-if (!code.includes('typeof e.frame.frame.close=="function"')) {
+if (!/\.frame\.frame\.close=="function"/.test(code)) {
   console.error('[check-rfb-patch] 补丁 3 未就位（渲染队列 VideoFrame 回收缺失），请重新运行 scripts/build-rfb-vendor.js 生成并应用补丁');
+  process.exit(1);
+}
+// 校验补丁 3b 已就位：img 尺寸不匹配改为丢弃该图并继续扫描（错误文案带 "(dropping)"），
+// 不再 return 卡死整个渲染队列（那会让其后所有 H.264 帧的 VideoFrame 只能等 GC，
+// 即用户看到的 "A VideoFrame was garbage collected without being closed"）。
+if (!code.includes('(dropping)')) {
+  console.error('[check-rfb-patch] 补丁 3b 未就位（img 尺寸不匹配仍会卡死渲染队列导致 VideoFrame 泄漏），请重新运行 scripts/build-rfb-vendor.js 生成并应用补丁');
   process.exit(1);
 }
 
