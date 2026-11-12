@@ -162,7 +162,7 @@
     const style = serverColor ? ` style="--connection-color:${serverColor}"` : '';
     return `<svg class="connection-icon ${connected ? 'connected' : 'disconnected'}${attention ? ' attention' : ''}${auto ? ' auto' : ''}${serverColor ? ' has-server-color' : ''}"${style} viewBox="0 0 24 24" role="img" aria-label="${auto ? '自动审批已开启（点击关闭）' : '点击开启自动审批'}"><path class="connection-bolt" d="M13.7 2.5 5.4 13.3h6.2l-1.3 8.2 8.3-11h-6.2l1.3-8Z"/>${connected ? '' : '<path class="connection-slash" d="M4.5 4.5 19.5 19.5"/>'}</svg>`;
   };
-  const CLIENT_BUILD_TAG = 'nexterm-evolution-30-clipboard-image-paste';
+  const CLIENT_BUILD_TAG = 'nexterm-evolution-41-tab-codex-scroll-fix';
   const notify = (message, type = 'info') => {
     const toast = document.createElement('div'); toast.textContent = message; toast.style.cssText = `position:fixed;right:18px;bottom:18px;z-index:30;background:${type === 'error' ? '#4d2029' : '#17372f'};border:1px solid ${type === 'error' ? '#9d4656' : '#2b8067'};color:#e8fff7;padding:11px 14px;border-radius:9px;font-size:13px;box-shadow:0 10px 30px #0005`;
     document.body.appendChild(toast); setTimeout(() => toast.remove(), 3000);
@@ -1283,30 +1283,20 @@
     if (!buffer) return false;
     return Number(buffer.viewportY) >= Number(buffer.baseY) + Number(terminal.rows || 0) - 1;
   }
-  // Whether scrollback history exists ABOVE the live tail.  baseY stays
-  // elevated after a full-screen TUI has scrolled output off the top, so it
-  // alone can read as "there is history" even when the visible tail sits
-  // directly above the prompt (the scrollback is then just the tail itself,
-  // and scrolling "up" is a no-op - the reader perceives dead scrolling).
-  // A marker registered at the bottom reports the first line of the tail;
-  // only lines below it are real history worth reading.  The marker is kept
-  // alive (xterm unlinks it on dispose) and is re-registered when the
-  // terminal is replaced (reconnect / snapshot restore).
-  const terminalTailMarkers = new WeakMap();
-  function terminalTailMarkerLine(tab) {
-    const terminal = tab?.terminal;
-    if (!terminal) return -1;
-    let marker = terminalTailMarkers.get(tab);
-    if (!marker || marker.dispose) {
-      try { marker = terminal.registerMarker(0); } catch { return -1; }
-      if (marker) terminalTailMarkers.set(tab, marker);
-    }
-    try { return Number(marker.line) || 0; } catch { return -1; }
-  }
+  // Whether the normal (main) buffer has scrollback above the live viewport.
+  // xterm's public buffer only exposes baseY/viewportY (the internal ybase is
+  // not on the API surface), so baseY is the total number of lines above the
+  // top of the window - i.e. how far up the reader can page.  A full-screen
+  // TUI (Codex) runs on the alternate buffer, so this reads the MAIN buffer's
+  // accumulated history; baseY stays elevated after the TUI exits, which is
+  // exactly when the reader wants to page up.  (An earlier marker-based
+  // comparison misread "no history": a marker registered at the bottom
+  // reports the absolute first tail line, which always exceeds baseY, so
+  // scrolling up was dead.)
   function terminalScrollbackAvailable(tab) {
     const buffer = tab?.terminal?.buffer?.active;
     if (!buffer) return false;
-    return Number(buffer.ybase || 0) > Math.max(0, terminalTailMarkerLine(tab));
+    return Number(buffer.baseY || 0) > 0;
   }
   function scrollTerminalToBottom(tab, force = false) {
     if (!tab?.terminal || (!force && tab.followOutput === false)) return;
@@ -1947,11 +1937,6 @@ function closeTab(tabId) { const tab = state.tabs.get(tabId); if (!tab) return; 
       // the appendChild line: a stray brace there silently turned all of this
       // into dead code and upward scrolling looked completely dead again.
       const scrollState = { holdUntil:0, momentumPaused:false, pendingMomentum:0, momentumFrame:null };
-      const scrollHistoryDepth = () => {
-        const buffer = tab.terminal?.buffer?.active;
-        if (!buffer) return 0;
-        return Math.max(0, Number(buffer.ybase) - Number(buffer.viewportY));
-      };
       const scrollRowHeight = () => {
         const rendered = Number(tab.terminal?._core?._renderService?.dimensions?.css?.cell?.height);
         if (Number.isFinite(rendered) && rendered > 0) return rendered;
@@ -1985,7 +1970,7 @@ function closeTab(tabId) { const tab = state.tabs.get(tabId); if (!tab) return; 
           if (!scrollState.momentumPaused) { scrollState.pendingMomentum = 0; return; }
           const amount = Math.round(scrollState.pendingMomentum / 6);
           if (amount) { tab.terminal?.scrollLines?.(-amount); scrollState.pendingMomentum -= amount * 6; }
-          if (scrollState.pendingMomentum && Number(tab.terminal?.buffer?.active?.ybase || 0) > Math.max(0, terminalTailMarkerLine(tab))) { scheduleMomentum(); return; }
+          if (scrollState.pendingMomentum && Number(tab.terminal?.buffer?.active?.baseY || 0) > 0) { scheduleMomentum(); return; }
           // The whole flick cannot be shown: keep the view where it is instead
           // of letting xterm re-clamp it to the tail on the next frame.
           if (scrollState.pendingMomentum && terminalAtBottom(tab)) tab.terminal?.scrollLines?.(-1);
