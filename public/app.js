@@ -133,6 +133,10 @@
     return body;
   };
   const escapeHtml = (value) => String(value ?? '').replace(/[&<>"']/g, (char) => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[char]));
+  const isOffline = () => typeof navigator !== 'undefined' && navigator.onLine === false;
+  let lastOfflineToastAt = 0;
+  const showOfflineToast = () => { const now = Date.now(); if (now - lastOfflineToastAt < 30000) return; lastOfflineToastAt = now; notify('网络已断开，正在等待恢复…', 'error'); };
+  const showOnlineToast = () => notify('网络已恢复', 'info');
   const userInitials = () => String(state.user?.username || 'NT').trim().slice(0, 2).toUpperCase();
   const avatarMarkup = () => state.user?.avatar ? `<img src="${escapeHtml(state.user.avatar)}" alt="${escapeHtml(state.user.username)} 的头像" />` : `<span>${escapeHtml(userInitials())}</span>`;
   function applyUserPreferences() {
@@ -546,8 +550,9 @@
     const version = $('[data-host-version]'); if (version) version.textContent = String(status.version || '未知');
   }
   async function refreshSystemStatus() {
+    if (isOffline()) return;
     try { state.systemStatus = await api('/api/system/status'); renderSystemStatus(); }
-    catch (error) { if (state.user) notify(error.message || '主机状态读取失败', 'error'); }
+    catch (error) { if (state.user && !isOffline()) notify(error.message || '主机状态读取失败', 'error'); }
   }
   function startSystemStatusPolling() {
     if (state.systemStatusTimer) clearInterval(state.systemStatusTimer);
@@ -569,7 +574,7 @@
     });
   }
   async function refreshServerStatuses() {
-    if (state.serverStatusRefreshing || !state.user) return;
+    if (state.serverStatusRefreshing || !state.user || isOffline()) return;
     state.serverStatusRefreshing = true;
     try {
       const result = await api('/api/servers/status');
@@ -1545,7 +1550,7 @@
     }
     refreshSessionTakeoverDialog();
   }
-  function scheduleReconnect(tab, immediate = false) { if (tab.manualClose || tab.reconnectTimer || !state.tabs.has(tab.id)) return; const delay = immediate ? 0 : Math.min(15000, 1000 * (2 ** Math.min(tab.reconnectAttempt++, 4))); tab.reconnectTimer = setTimeout(() => { tab.reconnectTimer = null; connectTab(tab); }, delay); }
+  function scheduleReconnect(tab, immediate = false) { if (tab.manualClose || tab.reconnectTimer || !state.tabs.has(tab.id) || isOffline()) return; const delay = immediate ? 0 : Math.min(15000, 1000 * (2 ** Math.min(tab.reconnectAttempt++, 4))); tab.reconnectTimer = setTimeout(() => { tab.reconnectTimer = null; connectTab(tab); }, delay); }
   // Codex CLI prints "Goodbye!" when the user types /exit (or the shell ends with
 // exit/EOF). Watch for it so we can clear this tab's approval history and drop
 // the reconnect loop.
@@ -1617,6 +1622,7 @@ function closeTab(tabId) { const tab = state.tabs.get(tabId); if (!tab) return; 
     if (tab.manualClose || tab.reconnectBlocked || (tab.ws && tab.ws.readyState <= WebSocket.OPEN)) return;
     tab.approvalStateSynced = false;
     const server = state.servers.find((item) => item.id === tab.serverId); if (!server) return;
+    if (isOffline()) { showOfflineToast(); if (!tab.reconnectTimer) { tab.reconnectAttempt = 0; tab.reconnectTimer = setTimeout(() => { tab.reconnectTimer = null; connectTab(tab); }, 15000); } return; }
     if (tab.kind === 'vnc') { if (!tab.view || !tab.vnc) createTabView(tab); return connectVncTab(tab, server); }
     if (!tab.view) createTabView(tab);
     watchTerminalSelection(tab);
@@ -2772,9 +2778,11 @@ function closeTab(tabId) { const tab = state.tabs.get(tabId); if (!tab) return; 
     if (document.hidden) return;
     state.tabs.forEach((tab) => {
       if (tab.manualClose) return;
-      if (!tab.ws || tab.ws.readyState > WebSocket.OPEN) { if (tab.reconnectTimer) clearTimeout(tab.reconnectTimer); tab.reconnectTimer = null; tab.reconnectAttempt = 0; connectTab(tab); }
+      if (tab.reconnectTimer) { clearTimeout(tab.reconnectTimer); tab.reconnectTimer = null; tab.reconnectAttempt = 0; }
+      if (!tab.ws || tab.ws.readyState > WebSocket.OPEN) connectTab(tab);
       else if (tab.id === state.activeTab) { fitTerminal(tab); sendResize(tab); }
     });
+    if (!isOffline()) { refreshSystemStatus(); refreshServerStatuses(); }
   }
   // Animated favicon: while any Codex session is working the tab icon spins
   // (a 12-position arc); a prompt waiting for input shows a static amber dot.
@@ -2827,7 +2835,8 @@ function closeTab(tabId) { const tab = state.tabs.get(tabId); if (!tab) return; 
   paintRunningFavicon(0, 0, 0);
   document.addEventListener('visibilitychange', () => { if (!document.hidden) { updateAttentionTitle(); resumeSessions(); } });
   window.addEventListener('focus', resumeSessions);
-  window.addEventListener('online', resumeSessions);
+  window.addEventListener('online', () => { showOnlineToast(); resumeSessions(); });
+  window.addEventListener('offline', () => { showOfflineToast(); });
   const releaseVncFrames = (closeDecoder = false) => { state.tabs.forEach((tab) => { try { tab?.vnc?.rfb?._vncUnpinVideoFrames?.(closeDecoder); } catch { /* ignore */ } }); };
   // 后台只释放已经解码完成的帧，保留 VideoDecoder 继续处理在途数据；关页
   // 或断开时才关闭解码器，避免恢复后因缺少关键帧而停住。
