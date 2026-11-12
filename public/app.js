@@ -162,7 +162,7 @@
     const style = serverColor ? ` style="--connection-color:${serverColor}"` : '';
     return `<svg class="connection-icon ${connected ? 'connected' : 'disconnected'}${attention ? ' attention' : ''}${auto ? ' auto' : ''}${serverColor ? ' has-server-color' : ''}"${style} viewBox="0 0 24 24" role="img" aria-label="${auto ? '自动审批已开启（点击关闭）' : '点击开启自动审批'}"><path class="connection-bolt" d="M13.7 2.5 5.4 13.3h6.2l-1.3 8.2 8.3-11h-6.2l1.3-8Z"/>${connected ? '' : '<path class="connection-slash" d="M4.5 4.5 19.5 19.5"/>'}</svg>`;
   };
-  const CLIENT_BUILD_TAG = 'nexterm-evolution-42-tab-codex-transcript-replay';
+  const CLIENT_BUILD_TAG = 'nexterm-evolution-43-tab-codex-alt-scroll';
   const notify = (message, type = 'info') => {
     const toast = document.createElement('div'); toast.textContent = message; toast.style.cssText = `position:fixed;right:18px;bottom:18px;z-index:30;background:${type === 'error' ? '#4d2029' : '#17372f'};border:1px solid ${type === 'error' ? '#9d4656' : '#2b8067'};color:#e8fff7;padding:11px 14px;border-radius:9px;font-size:13px;box-shadow:0 10px 30px #0005`;
     document.body.appendChild(toast); setTimeout(() => toast.remove(), 3000);
@@ -2076,9 +2076,19 @@ function closeTab(tabId) { const tab = state.tabs.get(tabId); if (!tab) return; 
           // gesture ends, so follow must not be re-derived from delta signs.
           tab.followOutput = event.deltaY > 0 && terminalAtBottom(tab);
           if (event.deltaY < 0 && terminalUsesMouseReporting(tab) && terminalScrollbackAvailable(tab) === false) {
-            // The TUI owns the viewport and there is no local history left to
-            // consume: absorb the rest of the flick instead of letting xterm
-            // re-clamp the viewport on the next frame.
+            // The active buffer is the alternate (TUI) and the main buffer has
+            // no scrollback.  xterm's alt buffer DOES keep its own scrollback
+            // (lines that scrolled off the top), so scroll it directly instead
+            // of forwarding the wheel to the TUI or absorbing the flick.
+            const activeBuffer = tab.terminal?.buffer?.active;
+            if (activeBuffer?.type === 'alternate') {
+              event.preventDefault();
+              event.stopImmediatePropagation();
+              noteTerminalScrollIntent(tab, event.deltaY);
+              scrollHistoryByPixels(wheelPixels(event));
+              return;
+            }
+            // No TUI and no main history: absorb.
             scrollState.momentumPaused = true;
             scrollState.pendingMomentum = event.deltaY;
             event.preventDefault();
@@ -2097,7 +2107,12 @@ function closeTab(tabId) { const tab = state.tabs.get(tabId); if (!tab) return; 
           touchX = Number(touch.clientX) || 0; touchY = Number(touch.clientY) || 0;
         }, { capture:true, passive:true });
         terminalElement.addEventListener('touchmove', (event) => {
-          if (!useLocalHistoryScroll()) return;
+          // Local history scroll (main buffer) or, while a full-screen TUI owns
+          // the viewport with no main history, the TUI's own alternate-buffer
+          // scrollback - so swiping up in Codex pages its transcript.
+          const activeBuffer = tab.terminal?.buffer?.active;
+          const tuiScrollable = terminalUsesMouseReporting(tab) && !terminalScrollbackAvailable(tab) && activeBuffer?.type === 'alternate';
+          if (!useLocalHistoryScroll() && !tuiScrollable) return;
           const touch = event.touches?.[0];
           if (!touch) return;
           const x = Number(touch.clientX) || 0; const y = Number(touch.clientY) || 0;
