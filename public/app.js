@@ -162,7 +162,7 @@
     const style = serverColor ? ` style="--connection-color:${serverColor}"` : '';
     return `<svg class="connection-icon ${connected ? 'connected' : 'disconnected'}${attention ? ' attention' : ''}${auto ? ' auto' : ''}${serverColor ? ' has-server-color' : ''}"${style} viewBox="0 0 24 24" role="img" aria-label="${auto ? '自动审批已开启（点击关闭）' : '点击开启自动审批'}"><path class="connection-bolt" d="M13.7 2.5 5.4 13.3h6.2l-1.3 8.2 8.3-11h-6.2l1.3-8Z"/>${connected ? '' : '<path class="connection-slash" d="M4.5 4.5 19.5 19.5"/>'}</svg>`;
   };
-  const CLIENT_BUILD_TAG = 'nexterm-evolution-41-tab-codex-scroll-fix';
+  const CLIENT_BUILD_TAG = 'nexterm-evolution-42-tab-codex-transcript-replay';
   const notify = (message, type = 'info') => {
     const toast = document.createElement('div'); toast.textContent = message; toast.style.cssText = `position:fixed;right:18px;bottom:18px;z-index:30;background:${type === 'error' ? '#4d2029' : '#17372f'};border:1px solid ${type === 'error' ? '#9d4656' : '#2b8067'};color:#e8fff7;padding:11px 14px;border-radius:9px;font-size:13px;box-shadow:0 10px 30px #0005`;
     document.body.appendChild(toast); setTimeout(() => toast.remove(), 3000);
@@ -1514,6 +1514,46 @@
     if (oldSocket) { oldSocket.onopen = null; oldSocket.onmessage = null; oldSocket.onclose = null; oldSocket.onerror = null; try { oldSocket.close(); } catch { /* socket already closed */ } }
     connectTab(tab);
   }
+  // Codex (and other full-screen TUIs) render on the alternate screen, which
+  // xterm discards the instant the program exits to the main buffer - so the
+  // finished conversation cannot be paged up.  While the TUI is on screen we
+  // mirror its lines (viewport + its own scrollback) each frame; when it exits
+  // we replay the mirrored text at the bottom of the main buffer, turning it
+  // into scrollback the reader can page up into.  A manual button offers the
+  // same replay while the TUI is still up.
+  const codexAltCaptures = new WeakMap();
+  function readTerminalAltLines(tab) {
+    const terminal = tab?.terminal; const buffer = terminal?.buffer?.active;
+    if (!buffer || buffer.type !== 'alternate') return null;
+    const start = Math.max(0, Number(buffer.viewportY) || 0);
+    const lines = [];
+    for (let index = start; index < buffer.length; index += 1) {
+      const line = buffer.getLine(index);
+      if (line) lines.push(line.translateToString(true));
+    }
+    return lines.length ? lines : null;
+  }
+  function captureTerminalAlt(tab) {
+    const lines = readTerminalAltLines(tab);
+    if (lines) codexAltCaptures.set(tab, lines);
+  }
+  function replayCodexTranscript(tab) {
+    const terminal = tab?.terminal;
+    if (!terminal || tab.kind !== 'ssh') return;
+    if (terminal.buffer?.active?.type === 'alternate') { captureTerminalAlt(tab); notify('已捕获当前 Codex 屏幕；退出 Codex 后即可向上翻阅这段记录。', 'info'); return; }
+    const captured = codexAltCaptures.get(tab);
+    if (!captured || !captured.length) { notify('没有可重放的 Codex 记录（本标签打开后尚未进入过全屏 TUI）。', 'info'); return; }
+    codexAltCaptures.delete(tab);
+    // Only useful on the main buffer: the captured TUI text becomes scrollback
+    // above the live tail, where the wheel takeover (baseY>0) lets the reader
+    // page up through it.
+    if (terminal.buffer?.active?.type !== 'normal') return;
+    tab.terminal.scrollLines(1e6); // pin to the live tail before prepending
+    const payload = captured.join('\r\n') + '\r\n';
+    terminal.write(payload);
+    tab.followOutput = true;
+    requestAnimationFrame(() => { terminal.scrollToBottom?.(); });
+  }
   function currentTakenOverTabs() {
     const tabs = [...state.takenOverTabs].map((id) => state.tabs.get(id)).filter((tab) => tab?.reconnectBlocked);
     state.takenOverTabs = new Set(tabs.map((tab) => tab.id)); return tabs;
@@ -1917,6 +1957,27 @@ function closeTab(tabId) { const tab = state.tabs.get(tabId); if (!tab) return; 
       });
       if (tab.id === state.activeTab) requestAnimationFrame(() => requestAnimationFrame(() => { if (!view.classList.contains('hidden')) { fitTerminal(tab); sendResize(tab); scrollTerminalToBottom(tab, true); } }));
       tab.terminal.onData((data) => { if (tab.restoring) return; tab.followOutput = true; if (tab.ws?.readyState === WebSocket.OPEN) tab.ws.send(JSON.stringify({ type:'input', data:btoa(unescape(encodeURIComponent(data))) })); if (!terminalAtBottom(tab)) requestAnimationFrame(() => { if (tab.followOutput !== false && !terminalUserScrolling(tab)) { tab.terminal?.scrollToBottom?.(); tab.terminal?.refresh(0, Math.max(0, tab.terminal.rows - 1)); } }); });
+      // Codex/full-screen TUIs live on the alternate buffer, which xterm wipes
+      // on exit - so the finished transcript is lost and cannot be paged up.
+      // xterm 5.5 exposes no public onBufferChange on Terminal, so track the
+      // buffer type from onRender (fires on every frame, including buffer
+      // switches that onScroll misses):
+      // mirror the TUI lines while it is on screen, then replay them into the
+      // main buffer's scrollback the moment it returns.
+      let lastBufferType = '';
+      const trackTerminalBuffer = () => {
+        if (tab.restoring) return;
+        const buffer = tab.terminal?.buffer?.active;
+        if (!buffer) return;
+        const type = buffer.type;
+        if (type === lastBufferType) return;
+        const wasAlternate = lastBufferType === 'alternate';
+        lastBufferType = type;
+        if (type === 'alternate') { captureTerminalAlt(tab); return; }
+        // Just returned to the main buffer: replay the mirrored TUI frame as
+        // scrollback so the reader can page up through the conversation.
+        if (wasAlternate) replayCodexTranscript(tab);
+      };
       // Scrolling the scrollback has to win against the live tail, otherwise the
       // view snaps back down on the next output chunk and upward wheel/touch
       // motion looks completely dead.  That fight is decided here:
@@ -2053,6 +2114,7 @@ function closeTab(tabId) { const tab = state.tabs.get(tabId); if (!tab) return; 
         terminalElement.addEventListener('touchcancel', endTouch, { capture:true, passive:true });
       }
       attachViewportFollow();
+      tab.terminal.onRender(() => { trackTerminalBuffer(); });
       tab.terminal.onScroll(() => { attachViewportFollow(); syncTerminalFollowFromViewport(); });
       new MutationObserver(attachViewportFollow).observe(terminalElement, { childList:true, subtree:true });
       terminalElement.addEventListener('paste', async (event) => {
