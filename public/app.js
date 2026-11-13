@@ -162,7 +162,7 @@
     const style = serverColor ? ` style="--connection-color:${serverColor}"` : '';
     return `<svg class="connection-icon ${connected ? 'connected' : 'disconnected'}${attention ? ' attention' : ''}${auto ? ' auto' : ''}${serverColor ? ' has-server-color' : ''}"${style} viewBox="0 0 24 24" role="img" aria-label="${auto ? '自动审批已开启（点击关闭）' : '点击开启自动审批'}"><path class="connection-bolt" d="M13.7 2.5 5.4 13.3h6.2l-1.3 8.2 8.3-11h-6.2l1.3-8Z"/>${connected ? '' : '<path class="connection-slash" d="M4.5 4.5 19.5 19.5"/>'}</svg>`;
   };
-  const CLIENT_BUILD_TAG = 'nexterm-evolution-45-tab-codex-alt-paging';
+  const CLIENT_BUILD_TAG = 'nexterm-evolution-47-tab-codex-transcript-reconstruct';
   const notify = (message, type = 'info') => {
     const toast = document.createElement('div'); toast.textContent = message; toast.style.cssText = `position:fixed;right:18px;bottom:18px;z-index:30;background:${type === 'error' ? '#4d2029' : '#17372f'};border:1px solid ${type === 'error' ? '#9d4656' : '#2b8067'};color:#e8fff7;padding:11px 14px;border-radius:9px;font-size:13px;box-shadow:0 10px 30px #0005`;
     document.body.appendChild(toast); setTimeout(() => toast.remove(), 3000);
@@ -1514,64 +1514,6 @@
     if (oldSocket) { oldSocket.onopen = null; oldSocket.onmessage = null; oldSocket.onclose = null; oldSocket.onerror = null; try { oldSocket.close(); } catch { /* socket already closed */ } }
     connectTab(tab);
   }
-  // Codex (and other full-screen TUIs) render on the alternate screen, which
-  // xterm discards the instant the program exits to the main buffer - so the
-  // finished conversation cannot be paged up.  While the TUI is on screen we
-  // mirror its lines (viewport + its own scrollback) each frame; when it exits
-  // we replay the mirrored text at the bottom of the main buffer, turning it
-  // into scrollback the reader can page up into.  A manual button offers the
-  // same replay while the TUI is still up.
-  const codexAltCaptures = new WeakMap();
-  // Codex repaints in place (clear + absolute cursor), so the alternate buffer
-  // never accumulates scrollback and the live view cannot be paged up.  To make
-  // the finished transcript readable after exit, we accumulate it here: each
-  // frame we diff the current alt screen against the previous capture and keep
-  // only the lines that changed (typing/scrolling produces new content).  The
-  // running transcript is replayed into the main buffer when the TUI exits.
-  const CODEX_TRANSCRIPT_MAX = 20000;
-  function captureTerminalAlt(tab) {
-    const terminal = tab?.terminal; const buffer = terminal?.buffer?.active;
-    if (!terminal || !buffer || buffer.type !== 'alternate') return;
-    const start = Math.max(0, Number(buffer.viewportY) || 0);
-    const lines = [];
-    for (let index = start; index < buffer.length; index += 1) {
-      const line = buffer.getLine(index);
-      lines.push(line ? line.translateToString(true) : '');
-    }
-    if (!lines.length) return;
-    const state = codexAltCaptures.get(tab) || { prev: [], transcript: [] };
-    // Append only lines that are new vs the previously seen screen so we do
-    // not re-record the whole static frame on every repaint.
-    let added = 0;
-    for (let index = 0; index < lines.length; index += 1) {
-      const prevLine = state.prev[index];
-      if (prevLine === undefined || prevLine !== lines[index]) { state.transcript.push(lines[index]); added += 1; }
-    }
-    state.prev = lines;
-    if (state.transcript.length > CODEX_TRANSCRIPT_MAX) state.transcript.splice(0, state.transcript.length - CODEX_TRANSCRIPT_MAX);
-    codexAltCaptures.set(tab, state);
-  }
-  function readCodexTranscript(tab) {
-    const state = codexAltCaptures.get(tab);
-    return state ? state.transcript : null;
-  }
-  function replayCodexTranscript(tab) {
-    const terminal = tab?.terminal;
-    if (!terminal || tab.kind !== 'ssh') return;
-    if (terminal.buffer?.active?.type === 'alternate') { captureTerminalAlt(tab); notify('已捕获当前 Codex 屏幕；退出 Codex 后即可向上翻阅这段记录。', 'info'); return; }
-    const transcript = readCodexTranscript(tab);
-    if (!transcript || !transcript.length) { codexAltCaptures.delete(tab); return; }
-    codexAltCaptures.delete(tab);
-    // Only useful on the main buffer: the transcript becomes scrollback above
-    // the live tail, where the wheel takeover (baseY>0) lets the reader page
-    // up through the finished Codex session.
-    if (terminal.buffer?.active?.type !== 'normal') return;
-    terminal.scrollLines(1e6); // pin to the live tail before prepending
-    const payload = transcript.join('\r\n') + '\r\n';
-    terminal.write(payload);
-    tab.followOutput = true;
-    requestAnimationFrame(() => { terminal.scrollToBottom?.(); });
-  }
   function currentTakenOverTabs() {
     const tabs = [...state.takenOverTabs].map((id) => state.tabs.get(id)).filter((tab) => tab?.reconnectBlocked);
     state.takenOverTabs = new Set(tabs.map((tab) => tab.id)); return tabs;
@@ -1979,9 +1921,8 @@ function closeTab(tabId) { const tab = state.tabs.get(tabId); if (!tab) return; 
       // on exit - so the finished transcript is lost and cannot be paged up.
       // xterm 5.5 exposes no public onBufferChange on Terminal, so track the
       // buffer type from onRender (fires on every frame, including buffer
-      // switches that onScroll misses):
-      // mirror the TUI lines while it is on screen, then replay them into the
-      // main buffer's scrollback the moment it returns.
+      // switches that onScroll misses) to know when the TUI starts and ends,
+      // which drives the byte-capture + offline transcript reconstruction.
       let lastBufferType = '';
       const trackTerminalBuffer = () => {
         if (tab.restoring) return;
@@ -1992,21 +1933,16 @@ function closeTab(tabId) { const tab = state.tabs.get(tabId); if (!tab) return; 
         const wasAlternate = lastBufferType === 'alternate';
         lastBufferType = type;
         if (type === 'alternate') {
-          codexAltCaptures.delete(tab); captureTerminalAlt(tab);
-          startAltPaging();
+          // Entering the TUI: start capturing its byte stream for the
+          // transcript we will reconstruct on exit.
+          altStartSession();
           return;
         }
-        // Just returned to the main buffer: replay the accumulated transcript
-        // as scrollback so the reader can page up through the conversation.
-        if (wasAlternate) replayCodexTranscript(tab);
-        if (altPageState.active) {
-          // The reader may still be paging the transcript after Codex exited;
-          // keep the mirror alive until the next alt session, then drop it.
-          altPageState.active = false;
-          altPageState.lastYdisp = 0;
-          try { terminalElement.classList.remove('nexterm-alt-paging'); } catch { /* element gone */ }
-          setTimeout(() => { if (!altPageState.active) clearAltPaging(); }, 120000);
-        }
+        // Just returned to the main buffer: the write-hook has already
+        // reconstructed and injected the transcript as scrollback (via
+        // altEndSession), so the existing wheel takeover can page up through
+        // the finished Codex conversation.
+        if (wasAlternate && altPageState.active) altEndSession();
       };
       // Scrolling the scrollback has to win against the live tail, otherwise the
       // view snaps back down on the next output chunk and upward wheel/touch
@@ -2054,102 +1990,80 @@ function closeTab(tabId) { const tab = state.tabs.get(tabId); if (!tab) return; 
         return pixels;
       };
       const useLocalHistoryScroll = () => terminalUsesMouseReporting(tab) && terminalScrollbackAvailable(tab);
-      // The Codex TUI redraws in place (clear + absolute cursor), so its
-      // alternate buffer accumulates no scrollback and upward paging looks
-      // dead while Codex is on screen. To make the conversation readable in
-      // place we intercept the byte stream the moment it enters the alt
-      // buffer: everything after that point is replayed into a detached
-      // mirror terminal, whose main buffer becomes the pageable transcript.
-      // On every render frame the mirror's scrollback is mirrored onto the
-      // xterm viewport element, so the wheel (xterm's own scroll handler
-      // stays in charge of the DOM scroll) pages the real transcript while
-      // the TUI keeps painting its live view on top.
-      const altPageState = { mirror:null, mirrorViewportEl:null, active:false, pendingWrite:'', lastYdisp:0, reading:false };
-      const altMirrorViewportEl = () => {
-        if (!altPageState.mirrorViewportEl && altPageState.mirror) {
-          const inner = altPageState.mirror.element?.querySelector?.('.xterm-viewport') || null;
-          if (inner) altPageState.mirrorViewportEl = inner;
-        }
-        return altPageState.mirrorViewportEl;
+      // Codex (and any full-screen TUI) paints in place on the alternate
+      // buffer, which never accumulates scrollback, and xterm's wheel handler
+      // rewrites the viewport every frame - so the buffer cannot be paged
+      // while the TUI is on screen.  The working fix: capture the raw byte
+      // stream for the whole alt session (onWriteParsed does not expose the
+      // string, so we wrap terminal.write), then - the moment the TUI exits -
+      // replay those bytes into a detached terminal and read the lines from
+      // (viewportY - a few rows) down to the tail.  In-place repaints collapse
+      // naturally, leaving a clean conversation, which we inject into the
+      // shell's real main buffer as genuine scrollback the existing wheel
+      // takeover can page through.
+      const altPageState = { bytes:null, active:false, lastType:'', mirror:null, mirrorHost:null };
+      const altAppendBytes = (text) => {
+        if (!altPageState.active || !text) return;
+        if (!altPageState.bytes) altPageState.bytes = '';
+        altPageState.bytes += text;
+        if (altPageState.bytes.length > 1572864) altPageState.bytes = altPageState.bytes.slice(-786432);
       };
-      const clearAltPaging = () => {
-        if (altPageState.mirror) { try { altPageState.mirror.dispose(); } catch { /* mirror gone */ } }
-        if (altPageState.mirrorViewportEl) { try { altPageState.mirrorViewportEl.remove(); } catch { /* detached */ } }
-        altPageState.mirror = null; altPageState.mirrorViewportEl = null;
-        altPageState.active = false; altPageState.pendingWrite = ''; altPageState.lastYdisp = 0; altPageState.reading = false;
-        try { terminalElement.classList.remove('nexterm-alt-paging'); } catch { /* element gone */ }
-      };
-      const ensureAltMirror = () => {
-        if (altPageState.mirror || !window.Terminal) return;
-        const rows = Math.max(4, Number(tab.terminal?.rows || 24));
-        const cols = Math.max(8, Number(tab.terminal?.cols || 80));
-        const mirror = new window.Terminal({ disableStdin:true, cursorBlink:false, convertEol:true, allowProposedApi:true, cols, rows, scrollback:20000, fontSize:13, theme:{ background:'#0b1119', foreground:'#d8e4f0' } });
-        const mirrorEl = document.createElement('div');
-        mirrorEl.style.cssText = 'position:absolute;left:-100000px;top:0;width:' + cols * 8 + 'px;height:' + rows * 17 + 'px;pointer-events:none;';
-        document.body.appendChild(mirrorEl);
-        try { mirror.open(mirrorEl); } catch { mirrorEl.remove(); return; }
-        mirror.attachCustomWheelEventHandler(() => false);
-        altPageState.mirror = mirror;
-        altPageState.lastYdisp = 0;
-        altPageState.mirror.refresh(0, Math.max(0, mirror.rows - 1));
-      };
-      const startAltPaging = () => {
+      const altStartSession = () => {
         if (altPageState.active) return;
-        ensureAltMirror();
-        const mirror = altPageState.mirror;
-        if (!mirror) return;
-        if (altPageState.pendingWrite) { try { mirror.write(altPageState.pendingWrite); } catch { /* mirror busy */ } altPageState.pendingWrite = ''; }
         altPageState.active = true;
-        altPageState.lastYdisp = Number(mirror.buffer?.active?.viewportY || 0);
-        const scrollEl = altMirrorViewportEl();
-        if (scrollEl && !scrollEl._nextermAltFollowWired) {
-          scrollEl._nextermAltFollowWired = true;
-          // A live TUI frame appends mirror lines below the viewport; keep
-          // the transcript pinned to the newest line unless the reader has
-          // paged up (scrollTop lagging behind means they are reading).
-          scrollEl.addEventListener('scroll', () => {
-            const max = Number(scrollEl.scrollHeight || 0) - Number(scrollEl.clientHeight || 0);
-            if (Number(scrollEl.scrollTop || 0) >= max - Number(scrollEl.clientHeight || 0) * 2) scrollEl.scrollTop = max;
-          }, { passive:true });
-        }
-        try { terminalElement.classList.add('nexterm-alt-paging'); } catch { /* element gone */ }
+        altPageState.bytes = '';
+        clearAltPagingMirror();
       };
-      const syncAltPagingViewport = () => {
-        const mirror = altPageState.mirror;
-        const viewportEl = altMirrorViewportEl();
-        const host = terminalElement?.querySelector?.('.xterm-viewport');
-        if (!altPageState.active || !mirror || !viewportEl || !host) return;
-        if (altPageState.pendingWrite) {
-          altPageState.flushing = true;
+      const clearAltPagingMirror = () => {
+        if (altPageState.mirror) { try { altPageState.mirror.dispose(); } catch { /* mirror gone */ } altPageState.mirror = null; }
+        if (altPageState.mirrorHost) { try { altPageState.mirrorHost.remove(); } catch { /* host gone */ } altPageState.mirrorHost = null; }
+      };
+      const altEndSession = () => {
+        if (!altPageState.active) return;
+        altPageState.active = false;
+        const bytes = altPageState.bytes;
+        altPageState.bytes = null;
+        if (!bytes || !window.Terminal) { clearAltPagingMirror(); return; }
+        // Reconstruct the conversation offline, then inject it as scrollback.
+        const cols = Math.max(8, Number(tab.terminal?.cols || 80));
+        const mirror = new window.Terminal({ disableStdin:true, cursorBlink:false, convertEol:true, allowProposedApi:true, cols, rows:24, scrollback:20000, fontSize:13, theme:{ background:'#0b1119', foreground:'#d8e4f0' } });
+        const host = document.createElement('div');
+        host.style.cssText = 'position:absolute;left:-100000px;top:0;width:' + cols * 8 + 'px;height:408px;pointer-events:none;';
+        document.body.appendChild(host);
+        altPageState.mirror = mirror;
+        altPageState.mirrorHost = host;
+        try { mirror.open(host); } catch { clearAltPagingMirror(); return; }
+        mirror.attachCustomWheelEventHandler(() => false);
+        const finish = () => {
           try {
-            const slice = altPageState.pendingWrite.slice(0, 4096);
-            mirror.write(slice);
-            altPageState.pendingWrite = altPageState.pendingWrite.slice(slice.length);
-          } catch { /* mirror disposed mid-flush */ }
-          altPageState.flushing = false;
-        }
-        const ydisp = Number(mirror.buffer?.active?.viewportY || 0);
-        if (altPageState.lastYdisp > 0 && ydisp === 0 && !altPageState.reading) {
-          // The reader is not paging: a live frame re-pinned the mirror to
-          // the tail, so keep following the newest line.
-          try { mirror.scrollToBottom(); } catch { /* mirror disposed */ }
-        }
-        altPageState.lastYdisp = ydisp;
-        const height = Number(mirror.buffer?.active?.length || 0) * Number(mirror._core?._renderService?.dimensions?.css?.cell?.height || 17);
-        if (height > 0 && Number(viewportEl.scrollHeight || 0) !== height) viewportEl.style.height = height + 'px';
-        const rows = Math.max(1, Number(mirror.rows || 1));
-        const rowHeight = Number(mirror._core?._renderService?.dimensions?.css?.cell?.height || 0) || (Number(host.clientHeight || 0) / rows);
-        const top = Math.max(0, (ydisp - (Number(mirror.buffer?.active?.baseY || 0))) * rowHeight);
-        const max = height - host.clientHeight;
-        if (Math.abs(Number(viewportEl.scrollTop || 0) - top) > 1) viewportEl.scrollTop = top;
-        altPageState.reading = max > 0 && Number(viewportEl.scrollTop || 0) < max - host.clientHeight;
+            const buffer = mirror.buffer?.active;
+            const lines = [];
+            if (buffer) {
+              // Read from the very top of the mirror's accumulated scrollback
+              // to the tail: in-place repaints collapse, leaving the clean
+              // conversation that has scrolled through the TUI this session.
+              const from = 0;
+              const to = Number(buffer.length || 0);
+              for (let index = from; index < to; index += 1) {
+                const line = buffer.getLine(index);
+                lines.push(line ? line.translateToString(true) : '');
+              }
+            }
+            const text = lines.join('\r\n');
+            if (text) {
+              tab.terminal.write(text + '\r\n');
+              requestAnimationFrame(() => { if (!terminalUserScrolling(tab)) tab.terminal?.scrollToBottom?.(); });
+            }
+          } catch { /* reconstruction failed */ }
+          clearAltPagingMirror();
+          if (tab.id === state.activeTab) fitTerminal(tab);
+        };
+        mirror.write(bytes, () => { setTimeout(finish, 60); });
       };
-      const stopAltPaging = () => { if (!altPageState.active) return; altPageState.active = false; altPageState.lastYdisp = 0; try { terminalElement.classList.remove('nexterm-alt-paging'); } catch { /* element gone */ } };
-      // xterm fires onWriteParsed without exposing the written string, so we
-      // wrap terminal.write to capture it ourselves.  The raw bytes are the
-      // transcript source of truth: while the alt buffer is active every
-      // chunk is replayed into the mirror terminal (its main buffer becomes
-      // the pageable scrollback).
+      // xterm's onWriteParsed does not expose the written string, so we wrap
+      // terminal.write to capture the raw bytes ourselves.  While the alt
+      // buffer is active we accumulate them; on exit altEndSession replays
+      // them into a detached terminal and injects the result as scrollback.
       const rawTerminalWrite = tab.terminal.write.bind(tab.terminal);
       tab.terminal.write = (data, callback) => {
         let text = '';
@@ -2157,26 +2071,15 @@ function closeTab(tabId) { const tab = state.tabs.get(tabId); if (!tab) return; 
         if (text && !tab.restoring) {
           const type = tab.terminal?.buffer?.active?.type;
           if (type === 'alternate') {
-            if (!altPageState.active) startAltPaging();
-            const mirror = altPageState.mirror;
-            if (mirror) {
-              // Backpressure: the mirror drains far slower than a busy TUI
-              // emits, so buffer the overflow here (bounded) and flush it in
-              // small slices from the render tick instead of feeding the
-              // write queue until xterm drops the chunk.
-              if (!altPageState.flushing) { try { mirror.write(text); } catch { altPageState.pendingWrite += text; } }
-              else altPageState.pendingWrite += text;
-              if (altPageState.pendingWrite.length > 524288) altPageState.pendingWrite = altPageState.pendingWrite.slice(-262144);
-            }
+            altStartSession();
+            altAppendBytes(text);
           } else if (altPageState.active) {
-            stopAltPaging();
-            requestAnimationFrame(() => { if (!altPageState.active) clearAltPaging(); });
+            altEndSession();
           }
         }
         if (typeof callback === 'function') return rawTerminalWrite(data, callback);
         return rawTerminalWrite(data);
       };
-      const syncAltPagingViewportFrame = () => { if (altPageState.active) syncAltPagingViewport(); };
       const scheduleMomentum = () => {
         if (scrollState.momentumFrame) return;
         scrollState.momentumFrame = requestAnimationFrame(() => {
@@ -2282,7 +2185,7 @@ function closeTab(tabId) { const tab = state.tabs.get(tabId); if (!tab) return; 
         terminalElement.addEventListener('touchcancel', endTouch, { capture:true, passive:true });
       }
       attachViewportFollow();
-      tab.terminal.onRender(() => { trackTerminalBuffer(); syncAltPagingViewportFrame(); });
+      tab.terminal.onRender(() => { trackTerminalBuffer(); });
       tab.terminal.onScroll(() => { attachViewportFollow(); syncTerminalFollowFromViewport(); });
       new MutationObserver(attachViewportFollow).observe(terminalElement, { childList:true, subtree:true });
       terminalElement.addEventListener('paste', async (event) => {
