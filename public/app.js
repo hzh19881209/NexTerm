@@ -162,7 +162,7 @@
     const style = serverColor ? ` style="--connection-color:${serverColor}"` : '';
     return `<svg class="connection-icon ${connected ? 'connected' : 'disconnected'}${attention ? ' attention' : ''}${auto ? ' auto' : ''}${serverColor ? ' has-server-color' : ''}"${style} viewBox="0 0 24 24" role="img" aria-label="${auto ? '自动审批已开启（点击关闭）' : '点击开启自动审批'}"><path class="connection-bolt" d="M13.7 2.5 5.4 13.3h6.2l-1.3 8.2 8.3-11h-6.2l1.3-8Z"/>${connected ? '' : '<path class="connection-slash" d="M4.5 4.5 19.5 19.5"/>'}</svg>`;
   };
-  const CLIENT_BUILD_TAG = 'nexterm-evolution-50-tab-codex-live-accum';
+  const CLIENT_BUILD_TAG = 'nexterm-evolution-51-tab-codex-exit-safe';
   const notify = (message, type = 'info') => {
     const toast = document.createElement('div'); toast.textContent = message; toast.style.cssText = `position:fixed;right:18px;bottom:18px;z-index:30;background:${type === 'error' ? '#4d2029' : '#17372f'};border:1px solid ${type === 'error' ? '#9d4656' : '#2b8067'};color:#e8fff7;padding:11px 14px;border-radius:9px;font-size:13px;box-shadow:0 10px 30px #0005`;
     document.body.appendChild(toast); setTimeout(() => toast.remove(), 3000);
@@ -1994,7 +1994,10 @@ function closeTab(tabId) { const tab = state.tabs.get(tabId); if (!tab) return; 
         codexReplay.active = false;
         const bytes = codexReplay.bytes;
         codexReplay.bytes = '';
-        if (!bytes || !window.Terminal) { codexReplayClearMirror(); return; }
+        codexReplayClearMirror();
+        // 退出时重建已由 xterm 核心补丁 3（_nextermFlushAltText，onBufferActivate
+        // 边界刷入主缓冲区 scrollback）负责，这里不再重复写入，避免会话记录重复。
+        return;
         // 方案 A（xterm 核心 alt 历史累积）若已在运行中把 Codex 输出累积进主缓冲区
         // scrollback（退出时主缓冲区 baseY 明显大于进入时），则跳过本离线重建，避免重复。
         const mainBaseYNow = Number(tab.terminal?.buffer?.active?.baseY || 0);
