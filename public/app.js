@@ -162,7 +162,7 @@
     const style = serverColor ? ` style="--connection-color:${serverColor}"` : '';
     return `<svg class="connection-icon ${connected ? 'connected' : 'disconnected'}${attention ? ' attention' : ''}${auto ? ' auto' : ''}${serverColor ? ' has-server-color' : ''}"${style} viewBox="0 0 24 24" role="img" aria-label="${auto ? '自动审批已开启（点击关闭）' : '点击开启自动审批'}"><path class="connection-bolt" d="M13.7 2.5 5.4 13.3h6.2l-1.3 8.2 8.3-11h-6.2l1.3-8Z"/>${connected ? '' : '<path class="connection-slash" d="M4.5 4.5 19.5 19.5"/>'}</svg>`;
   };
-  const CLIENT_BUILD_TAG = 'nexterm-evolution-43-tab-codex-alt-scroll';
+  const CLIENT_BUILD_TAG = 'nexterm-evolution-44-tab-codex-transcript-capture';
   const notify = (message, type = 'info') => {
     const toast = document.createElement('div'); toast.textContent = message; toast.style.cssText = `position:fixed;right:18px;bottom:18px;z-index:30;background:${type === 'error' ? '#4d2029' : '#17372f'};border:1px solid ${type === 'error' ? '#9d4656' : '#2b8067'};color:#e8fff7;padding:11px 14px;border-radius:9px;font-size:13px;box-shadow:0 10px 30px #0005`;
     document.body.appendChild(toast); setTimeout(() => toast.remove(), 3000);
@@ -1522,34 +1522,52 @@
   // into scrollback the reader can page up into.  A manual button offers the
   // same replay while the TUI is still up.
   const codexAltCaptures = new WeakMap();
-  function readTerminalAltLines(tab) {
+  // Codex repaints in place (clear + absolute cursor), so the alternate buffer
+  // never accumulates scrollback and the live view cannot be paged up.  To make
+  // the finished transcript readable after exit, we accumulate it here: each
+  // frame we diff the current alt screen against the previous capture and keep
+  // only the lines that changed (typing/scrolling produces new content).  The
+  // running transcript is replayed into the main buffer when the TUI exits.
+  const CODEX_TRANSCRIPT_MAX = 20000;
+  function captureTerminalAlt(tab) {
     const terminal = tab?.terminal; const buffer = terminal?.buffer?.active;
-    if (!buffer || buffer.type !== 'alternate') return null;
+    if (!terminal || !buffer || buffer.type !== 'alternate') return;
     const start = Math.max(0, Number(buffer.viewportY) || 0);
     const lines = [];
     for (let index = start; index < buffer.length; index += 1) {
       const line = buffer.getLine(index);
-      if (line) lines.push(line.translateToString(true));
+      lines.push(line ? line.translateToString(true) : '');
     }
-    return lines.length ? lines : null;
+    if (!lines.length) return;
+    const state = codexAltCaptures.get(tab) || { prev: [], transcript: [] };
+    // Append only lines that are new vs the previously seen screen so we do
+    // not re-record the whole static frame on every repaint.
+    let added = 0;
+    for (let index = 0; index < lines.length; index += 1) {
+      const prevLine = state.prev[index];
+      if (prevLine === undefined || prevLine !== lines[index]) { state.transcript.push(lines[index]); added += 1; }
+    }
+    state.prev = lines;
+    if (state.transcript.length > CODEX_TRANSCRIPT_MAX) state.transcript.splice(0, state.transcript.length - CODEX_TRANSCRIPT_MAX);
+    codexAltCaptures.set(tab, state);
   }
-  function captureTerminalAlt(tab) {
-    const lines = readTerminalAltLines(tab);
-    if (lines) codexAltCaptures.set(tab, lines);
+  function readCodexTranscript(tab) {
+    const state = codexAltCaptures.get(tab);
+    return state ? state.transcript : null;
   }
   function replayCodexTranscript(tab) {
     const terminal = tab?.terminal;
     if (!terminal || tab.kind !== 'ssh') return;
     if (terminal.buffer?.active?.type === 'alternate') { captureTerminalAlt(tab); notify('已捕获当前 Codex 屏幕；退出 Codex 后即可向上翻阅这段记录。', 'info'); return; }
-    const captured = codexAltCaptures.get(tab);
-    if (!captured || !captured.length) { notify('没有可重放的 Codex 记录（本标签打开后尚未进入过全屏 TUI）。', 'info'); return; }
+    const transcript = readCodexTranscript(tab);
+    if (!transcript || !transcript.length) { codexAltCaptures.delete(tab); return; }
     codexAltCaptures.delete(tab);
-    // Only useful on the main buffer: the captured TUI text becomes scrollback
-    // above the live tail, where the wheel takeover (baseY>0) lets the reader
-    // page up through it.
+    // Only useful on the main buffer: the transcript becomes scrollback above
+    // the live tail, where the wheel takeover (baseY>0) lets the reader page
+    // up through the finished Codex session.
     if (terminal.buffer?.active?.type !== 'normal') return;
-    tab.terminal.scrollLines(1e6); // pin to the live tail before prepending
-    const payload = captured.join('\r\n') + '\r\n';
+    terminal.scrollLines(1e6); // pin to the live tail before prepending
+    const payload = transcript.join('\r\n') + '\r\n';
     terminal.write(payload);
     tab.followOutput = true;
     requestAnimationFrame(() => { terminal.scrollToBottom?.(); });
@@ -1973,9 +1991,9 @@ function closeTab(tabId) { const tab = state.tabs.get(tabId); if (!tab) return; 
         if (type === lastBufferType) return;
         const wasAlternate = lastBufferType === 'alternate';
         lastBufferType = type;
-        if (type === 'alternate') { captureTerminalAlt(tab); return; }
-        // Just returned to the main buffer: replay the mirrored TUI frame as
-        // scrollback so the reader can page up through the conversation.
+        if (type === 'alternate') { codexAltCaptures.delete(tab); captureTerminalAlt(tab); return; }
+        // Just returned to the main buffer: replay the accumulated transcript
+        // as scrollback so the reader can page up through the conversation.
         if (wasAlternate) replayCodexTranscript(tab);
       };
       // Scrolling the scrollback has to win against the live tail, otherwise the
