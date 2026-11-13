@@ -162,7 +162,7 @@
     const style = serverColor ? ` style="--connection-color:${serverColor}"` : '';
     return `<svg class="connection-icon ${connected ? 'connected' : 'disconnected'}${attention ? ' attention' : ''}${auto ? ' auto' : ''}${serverColor ? ' has-server-color' : ''}"${style} viewBox="0 0 24 24" role="img" aria-label="${auto ? '自动审批已开启（点击关闭）' : '点击开启自动审批'}"><path class="connection-bolt" d="M13.7 2.5 5.4 13.3h6.2l-1.3 8.2 8.3-11h-6.2l1.3-8Z"/>${connected ? '' : '<path class="connection-slash" d="M4.5 4.5 19.5 19.5"/>'}</svg>`;
   };
-  const CLIENT_BUILD_TAG = 'nexterm-evolution-44-tab-codex-transcript-capture';
+  const CLIENT_BUILD_TAG = 'nexterm-evolution-45-tab-codex-alt-paging';
   const notify = (message, type = 'info') => {
     const toast = document.createElement('div'); toast.textContent = message; toast.style.cssText = `position:fixed;right:18px;bottom:18px;z-index:30;background:${type === 'error' ? '#4d2029' : '#17372f'};border:1px solid ${type === 'error' ? '#9d4656' : '#2b8067'};color:#e8fff7;padding:11px 14px;border-radius:9px;font-size:13px;box-shadow:0 10px 30px #0005`;
     document.body.appendChild(toast); setTimeout(() => toast.remove(), 3000);
@@ -1991,10 +1991,22 @@ function closeTab(tabId) { const tab = state.tabs.get(tabId); if (!tab) return; 
         if (type === lastBufferType) return;
         const wasAlternate = lastBufferType === 'alternate';
         lastBufferType = type;
-        if (type === 'alternate') { codexAltCaptures.delete(tab); captureTerminalAlt(tab); return; }
+        if (type === 'alternate') {
+          codexAltCaptures.delete(tab); captureTerminalAlt(tab);
+          startAltPaging();
+          return;
+        }
         // Just returned to the main buffer: replay the accumulated transcript
         // as scrollback so the reader can page up through the conversation.
         if (wasAlternate) replayCodexTranscript(tab);
+        if (altPageState.active) {
+          // The reader may still be paging the transcript after Codex exited;
+          // keep the mirror alive until the next alt session, then drop it.
+          altPageState.active = false;
+          altPageState.lastYdisp = 0;
+          try { terminalElement.classList.remove('nexterm-alt-paging'); } catch { /* element gone */ }
+          setTimeout(() => { if (!altPageState.active) clearAltPaging(); }, 120000);
+        }
       };
       // Scrolling the scrollback has to win against the live tail, otherwise the
       // view snaps back down on the next output chunk and upward wheel/touch
@@ -2042,6 +2054,129 @@ function closeTab(tabId) { const tab = state.tabs.get(tabId); if (!tab) return; 
         return pixels;
       };
       const useLocalHistoryScroll = () => terminalUsesMouseReporting(tab) && terminalScrollbackAvailable(tab);
+      // The Codex TUI redraws in place (clear + absolute cursor), so its
+      // alternate buffer accumulates no scrollback and upward paging looks
+      // dead while Codex is on screen. To make the conversation readable in
+      // place we intercept the byte stream the moment it enters the alt
+      // buffer: everything after that point is replayed into a detached
+      // mirror terminal, whose main buffer becomes the pageable transcript.
+      // On every render frame the mirror's scrollback is mirrored onto the
+      // xterm viewport element, so the wheel (xterm's own scroll handler
+      // stays in charge of the DOM scroll) pages the real transcript while
+      // the TUI keeps painting its live view on top.
+      const altPageState = { mirror:null, mirrorViewportEl:null, active:false, pendingWrite:'', lastYdisp:0, reading:false };
+      const altMirrorViewportEl = () => {
+        if (!altPageState.mirrorViewportEl && altPageState.mirror) {
+          const inner = altPageState.mirror.element?.querySelector?.('.xterm-viewport') || null;
+          if (inner) altPageState.mirrorViewportEl = inner;
+        }
+        return altPageState.mirrorViewportEl;
+      };
+      const clearAltPaging = () => {
+        if (altPageState.mirror) { try { altPageState.mirror.dispose(); } catch { /* mirror gone */ } }
+        if (altPageState.mirrorViewportEl) { try { altPageState.mirrorViewportEl.remove(); } catch { /* detached */ } }
+        altPageState.mirror = null; altPageState.mirrorViewportEl = null;
+        altPageState.active = false; altPageState.pendingWrite = ''; altPageState.lastYdisp = 0; altPageState.reading = false;
+        try { terminalElement.classList.remove('nexterm-alt-paging'); } catch { /* element gone */ }
+      };
+      const ensureAltMirror = () => {
+        if (altPageState.mirror || !window.Terminal) return;
+        const rows = Math.max(4, Number(tab.terminal?.rows || 24));
+        const cols = Math.max(8, Number(tab.terminal?.cols || 80));
+        const mirror = new window.Terminal({ disableStdin:true, cursorBlink:false, convertEol:true, allowProposedApi:true, cols, rows, scrollback:20000, fontSize:13, theme:{ background:'#0b1119', foreground:'#d8e4f0' } });
+        const mirrorEl = document.createElement('div');
+        mirrorEl.style.cssText = 'position:absolute;left:-100000px;top:0;width:' + cols * 8 + 'px;height:' + rows * 17 + 'px;pointer-events:none;';
+        document.body.appendChild(mirrorEl);
+        try { mirror.open(mirrorEl); } catch { mirrorEl.remove(); return; }
+        mirror.attachCustomWheelEventHandler(() => false);
+        altPageState.mirror = mirror;
+        altPageState.lastYdisp = 0;
+        altPageState.mirror.refresh(0, Math.max(0, mirror.rows - 1));
+      };
+      const startAltPaging = () => {
+        if (altPageState.active) return;
+        ensureAltMirror();
+        const mirror = altPageState.mirror;
+        if (!mirror) return;
+        if (altPageState.pendingWrite) { try { mirror.write(altPageState.pendingWrite); } catch { /* mirror busy */ } altPageState.pendingWrite = ''; }
+        altPageState.active = true;
+        altPageState.lastYdisp = Number(mirror.buffer?.active?.viewportY || 0);
+        const scrollEl = altMirrorViewportEl();
+        if (scrollEl && !scrollEl._nextermAltFollowWired) {
+          scrollEl._nextermAltFollowWired = true;
+          // A live TUI frame appends mirror lines below the viewport; keep
+          // the transcript pinned to the newest line unless the reader has
+          // paged up (scrollTop lagging behind means they are reading).
+          scrollEl.addEventListener('scroll', () => {
+            const max = Number(scrollEl.scrollHeight || 0) - Number(scrollEl.clientHeight || 0);
+            if (Number(scrollEl.scrollTop || 0) >= max - Number(scrollEl.clientHeight || 0) * 2) scrollEl.scrollTop = max;
+          }, { passive:true });
+        }
+        try { terminalElement.classList.add('nexterm-alt-paging'); } catch { /* element gone */ }
+      };
+      const syncAltPagingViewport = () => {
+        const mirror = altPageState.mirror;
+        const viewportEl = altMirrorViewportEl();
+        const host = terminalElement?.querySelector?.('.xterm-viewport');
+        if (!altPageState.active || !mirror || !viewportEl || !host) return;
+        if (altPageState.pendingWrite) {
+          altPageState.flushing = true;
+          try {
+            const slice = altPageState.pendingWrite.slice(0, 4096);
+            mirror.write(slice);
+            altPageState.pendingWrite = altPageState.pendingWrite.slice(slice.length);
+          } catch { /* mirror disposed mid-flush */ }
+          altPageState.flushing = false;
+        }
+        const ydisp = Number(mirror.buffer?.active?.viewportY || 0);
+        if (altPageState.lastYdisp > 0 && ydisp === 0 && !altPageState.reading) {
+          // The reader is not paging: a live frame re-pinned the mirror to
+          // the tail, so keep following the newest line.
+          try { mirror.scrollToBottom(); } catch { /* mirror disposed */ }
+        }
+        altPageState.lastYdisp = ydisp;
+        const height = Number(mirror.buffer?.active?.length || 0) * Number(mirror._core?._renderService?.dimensions?.css?.cell?.height || 17);
+        if (height > 0 && Number(viewportEl.scrollHeight || 0) !== height) viewportEl.style.height = height + 'px';
+        const rows = Math.max(1, Number(mirror.rows || 1));
+        const rowHeight = Number(mirror._core?._renderService?.dimensions?.css?.cell?.height || 0) || (Number(host.clientHeight || 0) / rows);
+        const top = Math.max(0, (ydisp - (Number(mirror.buffer?.active?.baseY || 0))) * rowHeight);
+        const max = height - host.clientHeight;
+        if (Math.abs(Number(viewportEl.scrollTop || 0) - top) > 1) viewportEl.scrollTop = top;
+        altPageState.reading = max > 0 && Number(viewportEl.scrollTop || 0) < max - host.clientHeight;
+      };
+      const stopAltPaging = () => { if (!altPageState.active) return; altPageState.active = false; altPageState.lastYdisp = 0; try { terminalElement.classList.remove('nexterm-alt-paging'); } catch { /* element gone */ } };
+      // xterm fires onWriteParsed without exposing the written string, so we
+      // wrap terminal.write to capture it ourselves.  The raw bytes are the
+      // transcript source of truth: while the alt buffer is active every
+      // chunk is replayed into the mirror terminal (its main buffer becomes
+      // the pageable scrollback).
+      const rawTerminalWrite = tab.terminal.write.bind(tab.terminal);
+      tab.terminal.write = (data, callback) => {
+        let text = '';
+        try { text = typeof data === 'string' ? data : (data ? new TextDecoder().decode(data) : ''); } catch { text = ''; }
+        if (text && !tab.restoring) {
+          const type = tab.terminal?.buffer?.active?.type;
+          if (type === 'alternate') {
+            if (!altPageState.active) startAltPaging();
+            const mirror = altPageState.mirror;
+            if (mirror) {
+              // Backpressure: the mirror drains far slower than a busy TUI
+              // emits, so buffer the overflow here (bounded) and flush it in
+              // small slices from the render tick instead of feeding the
+              // write queue until xterm drops the chunk.
+              if (!altPageState.flushing) { try { mirror.write(text); } catch { altPageState.pendingWrite += text; } }
+              else altPageState.pendingWrite += text;
+              if (altPageState.pendingWrite.length > 524288) altPageState.pendingWrite = altPageState.pendingWrite.slice(-262144);
+            }
+          } else if (altPageState.active) {
+            stopAltPaging();
+            requestAnimationFrame(() => { if (!altPageState.active) clearAltPaging(); });
+          }
+        }
+        if (typeof callback === 'function') return rawTerminalWrite(data, callback);
+        return rawTerminalWrite(data);
+      };
+      const syncAltPagingViewportFrame = () => { if (altPageState.active) syncAltPagingViewport(); };
       const scheduleMomentum = () => {
         if (scrollState.momentumFrame) return;
         scrollState.momentumFrame = requestAnimationFrame(() => {
@@ -2147,7 +2282,7 @@ function closeTab(tabId) { const tab = state.tabs.get(tabId); if (!tab) return; 
         terminalElement.addEventListener('touchcancel', endTouch, { capture:true, passive:true });
       }
       attachViewportFollow();
-      tab.terminal.onRender(() => { trackTerminalBuffer(); });
+      tab.terminal.onRender(() => { trackTerminalBuffer(); syncAltPagingViewportFrame(); });
       tab.terminal.onScroll(() => { attachViewportFollow(); syncTerminalFollowFromViewport(); });
       new MutationObserver(attachViewportFollow).observe(terminalElement, { childList:true, subtree:true });
       terminalElement.addEventListener('paste', async (event) => {
