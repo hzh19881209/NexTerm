@@ -8,7 +8,7 @@
 // 该文件被 .gitignore 忽略（public/vendor/ 整个目录不入库），每次构建前由
 // copy-vendor.js 调用本脚本重新生成。需要网络访问 codeload.github.com（GitHub 官方 tarball 分发地址，国内直连更稳定）。
 
-// 对 noVNC 打四个补丁（补丁 1、3、4 打包前改源码，补丁 2 压缩产物 token 替换）：
+// 对 noVNC 打五个补丁（补丁 1、3、4、5 打包前改源码，补丁 2 压缩产物 token 替换）：
 // 1. noVNC v1.6.0 的 H.264 解码器从不回收 VideoFrame，浏览器会反复打印
 //    "A VideoFrame was garbage collected without being closed"，长时间
 //    连接可能造成卡顿。此补丁在打包前直接修改 core/decoders/h264.js 源码
@@ -34,6 +34,10 @@
 //    rfb.js：每个 pending 包装对象持有幂等 release()，H264Context 跟踪所有
 //    未释放包装对象；Display 新增渲染队列全量释放入口；RFB 的
 //    _vncUnpinVideoFrames() 在断开时同时清理解码上下文与渲染队列。
+// 5. noVNC 的 WebCodecs H.264 能力探测会真实解码一帧，但 output 回调只记录
+//    “收到帧”而没有 close()。测试帧被 GC 时浏览器会打印
+//    "A VideoFrame was garbage collected without being closed"。补丁 5 在
+//    回调中立即关闭测试帧，并在 flush 后关闭探测用解码器。
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
@@ -51,7 +55,8 @@ function clean() {
 }
 
 // 对 esbuild 压缩产物校验/打补丁。
-// 补丁 1、3、4 已在打包前以源码方式打入 h264.js / display.js / rfb.js，
+// 补丁 1、3、4、5 已在打包前以源码方式打入 h264.js / display.js / rfb.js /
+// util/browser.js，
 // 这里校验产物确实包含补丁语句：
 //   - 补丁 1：_handleFrame 方法体调用 _releasePendingFrame；
 //   - 补丁 4：H264Context.releaseFrames() 与 Display._vncReleaseVideoFrames；
@@ -93,6 +98,12 @@ function applyNovncPatches(file) {
     }
   }
 
+  // 校验补丁 5：H.264 能力探测的 output 回调必须关闭测试 VideoFrame。
+  const probeFrameClosed = /new VideoDecoder\(\{output:[^}]{0,240}?\.close\(\)/.test(code);
+  if (!probeFrameClosed) {
+    fail('noVNC 补丁 5 未进入产物（H.264 能力探测帧未 close），请检查 core/util/browser.js 的锚点');
+  }
+
   // 补丁 2：断开超时 ba 从 3 秒放大到 10 秒。
   const timeoutAnchor = 'var ba=3,';
   if (!code.includes(timeoutAnchor)) fail('noVNC 补丁 2 锚点未找到（断开超时 ba），产物未打补丁');
@@ -124,6 +135,58 @@ try {
   if (!source) fail('未在 tarball 中找到 noVNC 源码目录');
   const core = path.join(tmp, source, 'core');
   if (!fs.existsSync(path.join(core, 'rfb.js'))) fail('noVNC 源码缺少 core/rfb.js');
+
+  // 补丁 5：能力探测实际解码一帧用于判断 WebCodecs H.264 是否可用。
+  // 上游 output 回调没有 close()，测试帧被 GC 时浏览器会报 VideoFrame 未关闭。
+  const browserFile = path.join(core, 'util', 'browser.js');
+  let browserSource = fs.readFileSync(browserFile, 'utf8');
+  const browserOutputAnchor = [
+    '    let decoder = new VideoDecoder({',
+    '        output: (frame) => { gotframe = true; },',
+    '        error: (e) => { error = e; },',
+    '    });',
+  ].join('\n');
+  const browserOutputPatched = [
+    '    let decoder = new VideoDecoder({',
+    '        output: (frame) => {',
+    '            gotframe = true;',
+    '            // NexTerm patch: the probe owns this frame; close it immediately',
+    '            // or the browser reports a VideoFrame GC leak.',
+    '            frame.close();',
+    '        },',
+    '        error: (e) => { error = e; },',
+    '    });',
+  ].join('\n');
+  if (!browserSource.includes(browserOutputAnchor)) fail('noVNC browser.js 补丁 5 锚点未找到（能力探测 output），请核对 noVNC 版本');
+  browserSource = browserSource.replace(browserOutputAnchor, browserOutputPatched, 1);
+
+  const browserFlushAnchor = [
+    '    } catch (e) {',
+    '        // Firefox incorrectly throws an exception here',
+    '        // https://bugzilla.mozilla.org/show_bug.cgi?id=1932566',
+    '        error = e;',
+    '    }',
+  ].join('\n');
+  const browserFlushPatched = [
+    '    } catch (e) {',
+    '        // Firefox incorrectly throws an exception here',
+    '        // https://bugzilla.mozilla.org/show_bug.cgi?id=1932566',
+    '        error = e;',
+    '    } finally {',
+    '        // The probe decoder is single-use; release it after the frame has',
+    '        // been delivered and closed.',
+    '        try {',
+    '            if (decoder.state !== "closed") {',
+    '                decoder.close();',
+    '            }',
+    '        } catch (e) {',
+    '            // Ignore a decoder that the browser already tore down.',
+    '        }',
+    '    }',
+  ].join('\n');
+  if (!browserSource.includes(browserFlushAnchor)) fail('noVNC browser.js 补丁 5 锚点未找到（flush 收尾），请核对 noVNC 版本');
+  browserSource = browserSource.replace(browserFlushAnchor, browserFlushPatched, 1);
+  fs.writeFileSync(browserFile, browserSource);
 
   // 补丁 1：H.264 解码回调 _handleFrame 中，pending 帧不保留时回收 VideoFrame。
   // 补丁 3：渲染动作出队（_scanRenderQ 的 ready 分支）时回收 img/frame

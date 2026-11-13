@@ -6,7 +6,8 @@
 //    typeof e.frame.frame.close=="function"）；
 // 4. 补丁 4：解码上下文与 Display 渲染队列在断开时全量释放（releaseFrames /
 //    _vncReleaseVideoFrames）；
-// 5. ES module 语法解析（优先 esbuild，缺失时回退 node:vm SourceTextModule）。
+// 5. 补丁 5：H.264 能力探测的测试 VideoFrame 在 output 回调中立即 close；
+// 6. ES module 语法解析（优先 esbuild，缺失时回退 node:vm SourceTextModule）。
 const fs = require('fs');
 const path = require('path');
 const { spawnSync } = require('child_process');
@@ -53,6 +54,13 @@ for (const required of ['releaseFrames()', '_vncReleaseVideoFrames', '_retainedF
     console.error(`[check-rfb-patch] 补丁 4 未就位（缺少 ${required}），请重新运行 scripts/build-rfb-vendor.js 生成并应用补丁`);
     process.exit(1);
   }
+}
+
+// 校验补丁 5：noVNC 模块加载时会真实解码一帧探测 H.264 支持；测试帧必须
+// 在 output 回调中关闭，否则被 GC 时浏览器会报 VideoFrame 未关闭。
+if (!/new VideoDecoder\(\{output:[^}]{0,240}?\.close\(\)/.test(code)) {
+  console.error('[check-rfb-patch] 补丁 5 未就位（H.264 能力探测帧未 close），请重新运行 scripts/build-rfb-vendor.js 生成并应用补丁');
+  process.exit(1);
 }
 
 // 校验补丁 3 已就位：渲染队列出队处回收 Image / 未关闭的 VideoFrame。

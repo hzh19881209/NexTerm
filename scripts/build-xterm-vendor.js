@@ -2,14 +2,17 @@
 //
 // 背景：标准 xterm.js 的备用缓冲区（alternate buffer）从不积累 scrollback
 // （源码 BufferSet.reset 注释原话 "The alt buffer should never have scrollback"），
-// 导致 Codex 等全屏 TUI 运行中无法上翻。Tabby 能翻是因为它的终端核心放开了
-// 这一限制。本脚本从 npm 拉取 @xterm/xterm 5.5.0 官方源码，打两个补丁后用
+// 导致会向上滚动的全屏 TUI 没有本地历史。本脚本从 npm 拉取 @xterm/xterm 5.5.0
+// 官方源码，打备用缓冲区 scrollback 与 TUI 退出时的历史落盘补丁后用
 // esbuild 重新打包：
 //   补丁 1（alt-scrollback）：Buffer 构造时给备用缓冲区保留 scrollback，使
-//     Codex 往上滚出的行真正保留、ybase 持续增大；
-//   补丁 2（wheel-local）：TUI 开着鼠标上报（enable-mouse-events）且备用
-//     缓冲区已有 scrollback 时，滚轮不再转发给 TUI，而是本地回翻备用
-//     缓冲区（否则 xterm 把滚轮当 SGR 鼠标事件发给 Codex，上翻失效）。
+//     会向上滚动的 TUI 留在缓冲区里的行真正保留；
+//   补丁 3（alt-history）：TUI 退出、切回主缓冲区时，把会话行一次性写入
+//     scrollback，之后可用普通终端历史回看。
+//
+// 不要在 xterm 的 sendEvent 里拦截备用缓冲区滚轮：Codex 开着鼠标上报，
+// 滚轮必须交回 TUI；此前用 this.element 判断的补丁在严格模式下 this 为
+// undefined，且会抢走 Codex 自己的上下滚动。
 //
 // 该文件被 .gitignore 忽略（public/vendor/ 整个目录不入库），每次构建由
 // copy-vendor.js 调用本脚本重新生成。需要网络访问 registry.npmjs.org。
@@ -36,15 +39,13 @@ function fail(message) {
   process.exit(1);
 }
 
-// 校验 esbuild 压缩产物确实包含两个补丁的标记字符串（字符串字面量 minify 后保留）。
+// 校验参考实现已经进入产物。Buffer 类会被 esbuild 重命名，因此只匹配构造参数。
 function verifyOutput(file) {
   const code = fs.readFileSync(file, 'utf8');
-  // 补丁 2（wheel-local）：运行时条件 enable-mouse-events + alternate + ybase>0。
-  // 该条件只可能来自打补丁后的产物，其存在即证明产物为带补丁版本。
-  const hasWheelLocal = /enable-mouse-events[\s\S]{0,240}?alternate[\s\S]{0,120}?ybase/.test(code);
-  if (!hasWheelLocal) fail('补丁 2（滚轮本地接管）运行时条件未进入产物，请核对 Terminal.ts 锚点');
-  // 补丁 1（alt-scrollback）与补丁 2 同一次构建一起打入；wheel-local 存在即
-  // 代表二者均在产物中（esbuild 会重命名 Buffer 类，无法用字面量特征校验）。
+  const hasAltScrollback = /this\._alt = new [\w$]+\(true, this\._optionsService, this\._bufferService\)/.test(code);
+  if (!hasAltScrollback) fail('补丁 1（备用缓冲区 scrollback）未进入产物，请核对 BufferSet.ts 锚点');
+  const hasAltHistory = code.includes('_nextermAccumAltLine') && code.includes('_nextermFlushAltText');
+  if (!hasAltHistory) fail('补丁 3（TUI 退出历史落盘）未进入产物，请核对 BufferService.ts 锚点');
 }
 
 (async () => {
@@ -61,9 +62,8 @@ function verifyOutput(file) {
     execFileSync('tar', ['-xzf', tarball, '-C', tmp], { stdio: 'inherit' });
     const source = path.join(tmp, 'package');
     const bufferSetFile = path.join(source, 'src', 'common', 'buffer', 'BufferSet.ts');
-    const terminalFile = path.join(source, 'src', 'browser', 'Terminal.ts');
     const bufferServiceFile = path.join(source, 'src', 'common', 'services', 'BufferService.ts');
-    if (!fs.existsSync(bufferSetFile) || !fs.existsSync(terminalFile) || !fs.existsSync(bufferServiceFile)) fail('xterm 源码缺少 BufferSet.ts / Terminal.ts / BufferService.ts');
+    if (!fs.existsSync(bufferSetFile) || !fs.existsSync(bufferServiceFile)) fail('xterm 源码缺少 BufferSet.ts / BufferService.ts');
 
     // ---- 补丁 1：备用缓冲区保留 scrollback ----
     // BufferSet.reset() 中：this._alt = new Buffer(false, ...) 的 false 即
@@ -77,7 +77,7 @@ function verifyOutput(file) {
     bufferSet = bufferSet.replace(bsAnchor, bsPatch, 1);
     fs.writeFileSync(bufferSetFile, bufferSet);
 
-    // ---- 补丁 3：备用缓冲区历史累积到主缓冲区（Codex 运行中可上翻）----
+    // ---- 补丁 3：备用缓冲区历史累积到主缓冲区（TUI 退出后可上翻）----
     // 锚点与替换串集中在 scripts/xterm-patch3.js，避免在构建脚本里内联大段 TS 源码。
     const p3 = require(path.join(__dirname, 'xterm-patch3.js'));
     let bufferService = fs.readFileSync(bufferServiceFile, 'utf8');
@@ -89,38 +89,6 @@ function verifyOutput(file) {
     bufferService = bufferService.replace(p3.scrollAnchor, p3.scrollPatch, 1);
     bufferService = bufferService.replace(p3.methodAnchor, p3.methodPatch + p3.methodAnchor, 1);
     fs.writeFileSync(bufferServiceFile, bufferService);
-
-        // ---- 补丁 2：TUI 鼠标上报且有 alt scrollback 时，滚轮本地接管 ----
-    // Terminal 的 wheel 处理里，若 _customWheelEventHandler 拒绝（返回 false）
-    // 或 amount===0 会 return false，事件继续冒泡到 Viewport 的 onwheel，由
-    // 其执行本地 scrollLines（xterm 自身"滚轮翻页"路径）。Codex 开着鼠标上报
-    // 时默认会把滚轮转成 SGR 鼠标事件发给 TUI；这里在补丁处提前把"备用缓冲
-    // 区已有 scrollback"的情况交给 Viewport 本地回翻，用户即可上翻会话。
-    // 用 data-nexterm-wheel-local 作为可被 check 脚本识别的标记。
-    let terminal = fs.readFileSync(terminalFile, 'utf8');
-    const termAnchor = [
-      "        case 'wheel':",
-      '          if (self._customWheelEventHandler && self._customWheelEventHandler(ev as WheelEvent) === false) {',
-      '            return false;',
-      '          }',
-      '          const amount = self.viewport!.getLinesScrolled(ev as WheelEvent);',
-    ].join('\n');
-    const termPatch = [
-      "        case 'wheel':",
-      '          if (self._customWheelEventHandler && self._customWheelEventHandler(ev as WheelEvent) === false) {',
-      '            return false;',
-      '          }',
-      '          const amount = self.viewport!.getLinesScrolled(ev as WheelEvent);',
-      '          // nexterm-wheel-local: 备用缓冲区有 scrollback 时（Codex 等 TUI 已往上滚出历史），',
-      '          // 滚轮不再转发给 TUI（返回 false 使事件继续冒泡到 Viewport 的 onwheel 本地回翻）。',
-      "          if (this.element && this.element.classList.contains('enable-mouse-events') &&",
-      "          this._bufferService.buffer.type === 'alternate' && this._bufferService.buffer.ybase > 0) {",
-      '            return false; // nexterm-wheel-local-active',
-      '          }',
-    ].join('\n');
-    if (!terminal.includes(termAnchor)) fail('xterm Terminal.ts 补丁 2 锚点未找到（wheel case），请核对 xterm 版本');
-    terminal = terminal.replace(termAnchor, termPatch, 1);
-    fs.writeFileSync(terminalFile, terminal);
 
     // ---- 打包 ----
     // 入口直接导出 xterm 的 Terminal，保持与原 <script src=xterm.js> 的
@@ -200,7 +168,7 @@ function verifyOutput(file) {
     fs.writeFileSync(outJs, packed + '\n;window.Terminal = window.Terminal || (xtermVendor && xtermVendor.Terminal);\n');
 
     verifyOutput(outJs);
-    console.log(`[build-xterm-vendor] 已生成 ${path.relative(root, outJs)}（${fs.statSync(outJs).size} 字节，含 alt-scrollback + wheel-local 补丁）`);
+    console.log(`[build-xterm-vendor] 已生成 ${path.relative(root, outJs)}（${fs.statSync(outJs).size} 字节，含 alt-scrollback + alt-history 补丁）`);
   } catch (error) {
     fail(`生成 xterm.js 失败：${error.message || error}`);
   } finally {

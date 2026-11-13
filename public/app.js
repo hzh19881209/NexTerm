@@ -162,7 +162,7 @@
     const style = serverColor ? ` style="--connection-color:${serverColor}"` : '';
     return `<svg class="connection-icon ${connected ? 'connected' : 'disconnected'}${attention ? ' attention' : ''}${auto ? ' auto' : ''}${serverColor ? ' has-server-color' : ''}"${style} viewBox="0 0 24 24" role="img" aria-label="${auto ? '自动审批已开启（点击关闭）' : '点击开启自动审批'}"><path class="connection-bolt" d="M13.7 2.5 5.4 13.3h6.2l-1.3 8.2 8.3-11h-6.2l1.3-8Z"/>${connected ? '' : '<path class="connection-slash" d="M4.5 4.5 19.5 19.5"/>'}</svg>`;
   };
-  const CLIENT_BUILD_TAG = 'nexterm-evolution-51-tab-codex-exit-safe';
+  const CLIENT_BUILD_TAG = 'nexterm-evolution-52-codex-wheel-native';
   const notify = (message, type = 'info') => {
     const toast = document.createElement('div'); toast.textContent = message; toast.style.cssText = `position:fixed;right:18px;bottom:18px;z-index:30;background:${type === 'error' ? '#4d2029' : '#17372f'};border:1px solid ${type === 'error' ? '#9d4656' : '#2b8067'};color:#e8fff7;padding:11px 14px;border-radius:9px;font-size:13px;box-shadow:0 10px 30px #0005`;
     document.body.appendChild(toast); setTimeout(() => toast.remove(), 3000);
@@ -1963,7 +1963,12 @@ function closeTab(tabId) { const tab = state.tabs.get(tabId); if (!tab) return; 
         else if (event.deltaMode === 2) pixels *= scrollRowHeight() * Math.max(1, Number(tab.terminal?.rows || 1));
         return pixels;
       };
-      const useLocalHistoryScroll = () => terminalUsesMouseReporting(tab) && terminalScrollbackAvailable(tab);
+      // Only the normal buffer has reader-owned history.  The alternate buffer
+      // belongs to the full-screen TUI: Codex enables mouse reporting and uses
+      // wheel events itself, so intercepting them here makes upward scrolling a
+      // no-op while also fighting xterm's own mouse-reporting path.
+      const useLocalHistoryScroll = () => tab.terminal?.buffer?.active?.type === 'normal'
+        && terminalUsesMouseReporting(tab) && terminalScrollbackAvailable(tab);
       // 方案 B（退出后离线重建）：Codex 用 clear+绝对定位原地重绘备用缓冲区，
       // 从不让行滚出屏幕，因此 alt-scrollback 对 Codex 本体不积累历史、运行中
       // 无法上翻。这里把整段备用缓冲区会话的原始字节流抓下来，退出 TUI 的瞬间
@@ -2078,6 +2083,11 @@ function closeTab(tabId) { const tab = state.tabs.get(tabId); if (!tab) return; 
         viewport.addEventListener('scroll', syncTerminalFollowFromViewport, { passive:true });
         terminalElement.addEventListener('wheel', (event) => {
           if (!event.deltaY || event.ctrlKey) return;
+          // A full-screen TUI owns the alternate buffer and its mouse protocol.
+          // Let xterm forward the wheel to Codex instead of scrolling an empty
+          // alternate-buffer scrollback. This applies in both directions: Codex
+          // handles wheel-up and wheel-down itself.
+          if (tab.terminal?.buffer?.active?.type === 'alternate') return;
           // Codex keeps mouse reporting enabled in its idle prompt. xterm then
           // forwards the wheel to the TUI instead of scrolling its own buffer,
           // so finished output cannot be read until Codex exits. When the
@@ -2099,18 +2109,6 @@ function closeTab(tabId) { const tab = state.tabs.get(tabId); if (!tab) return; 
           // gesture ends, so follow must not be re-derived from delta signs.
           tab.followOutput = event.deltaY > 0 && terminalAtBottom(tab);
           if (event.deltaY < 0 && terminalUsesMouseReporting(tab) && terminalScrollbackAvailable(tab) === false) {
-            // The active buffer is the alternate (TUI) and the main buffer has
-            // no scrollback.  xterm's alt buffer DOES keep its own scrollback
-            // (lines that scrolled off the top), so scroll it directly instead
-            // of forwarding the wheel to the TUI or absorbing the flick.
-            const activeBuffer = tab.terminal?.buffer?.active;
-            if (activeBuffer?.type === 'alternate') {
-              event.preventDefault();
-              event.stopImmediatePropagation();
-              noteTerminalScrollIntent(tab, event.deltaY);
-              scrollHistoryByPixels(wheelPixels(event));
-              return;
-            }
             // No TUI and no main history: absorb.
             scrollState.momentumPaused = true;
             scrollState.pendingMomentum = event.deltaY;
