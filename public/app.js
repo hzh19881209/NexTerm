@@ -162,7 +162,7 @@
     const style = serverColor ? ` style="--connection-color:${serverColor}"` : '';
     return `<svg class="connection-icon ${connected ? 'connected' : 'disconnected'}${attention ? ' attention' : ''}${auto ? ' auto' : ''}${serverColor ? ' has-server-color' : ''}"${style} viewBox="0 0 24 24" role="img" aria-label="${auto ? '自动审批已开启（点击关闭）' : '点击开启自动审批'}"><path class="connection-bolt" d="M13.7 2.5 5.4 13.3h6.2l-1.3 8.2 8.3-11h-6.2l1.3-8Z"/>${connected ? '' : '<path class="connection-slash" d="M4.5 4.5 19.5 19.5"/>'}</svg>`;
   };
-  const CLIENT_BUILD_TAG = 'nexterm-evolution-49-tab-codex-exit-replay';
+  const CLIENT_BUILD_TAG = 'nexterm-evolution-50-tab-codex-live-accum';
   const notify = (message, type = 'info') => {
     const toast = document.createElement('div'); toast.textContent = message; toast.style.cssText = `position:fixed;right:18px;bottom:18px;z-index:30;background:${type === 'error' ? '#4d2029' : '#17372f'};border:1px solid ${type === 'error' ? '#9d4656' : '#2b8067'};color:#e8fff7;padding:11px 14px;border-radius:9px;font-size:13px;box-shadow:0 10px 30px #0005`;
     document.body.appendChild(toast); setTimeout(() => toast.remove(), 3000);
@@ -1971,7 +1971,7 @@ function closeTab(tabId) { const tab = state.tabs.get(tabId); if (!tab) return; 
       // shell 真实主缓冲区成为 scrollback，既有滚轮本地接管即可上翻整段 Codex 会话。
       // 与方案 A 的 xterm 核心 alt-scrollback 互不干扰：A 负责"会向上滚动的 TUI"，
       // B 负责"Codex 这类原地重绘 TUI 的退出后回看"。
-      const codexReplay = { bytes:'', active:false, mirror:null, mirrorHost:null };
+      const codexReplay = { bytes:'', active:false, mirror:null, mirrorHost:null, mainBaseYAtStart:0 };
       const codexReplayAppend = (text) => {
         if (!codexReplay.active || !text) return;
         codexReplay.bytes += text;
@@ -1981,6 +1981,8 @@ function closeTab(tabId) { const tab = state.tabs.get(tabId); if (!tab) return; 
         if (codexReplay.active) return;
         codexReplay.active = true;
         codexReplay.bytes = '';
+        // 记录进入 TUI 时主缓冲区的 baseY，用于退出时判断方案 A 是否已累积历史。
+        codexReplay.mainBaseYAtStart = Number(tab.terminal?.buffer?.active?.baseY || 0);
         codexReplayClearMirror();
       };
       const codexReplayClearMirror = () => {
@@ -1993,6 +1995,10 @@ function closeTab(tabId) { const tab = state.tabs.get(tabId); if (!tab) return; 
         const bytes = codexReplay.bytes;
         codexReplay.bytes = '';
         if (!bytes || !window.Terminal) { codexReplayClearMirror(); return; }
+        // 方案 A（xterm 核心 alt 历史累积）若已在运行中把 Codex 输出累积进主缓冲区
+        // scrollback（退出时主缓冲区 baseY 明显大于进入时），则跳过本离线重建，避免重复。
+        const mainBaseYNow = Number(tab.terminal?.buffer?.active?.baseY || 0);
+        if (mainBaseYNow > codexReplay.mainBaseYAtStart + 4) { codexReplayClearMirror(); return; }
         const cols = Math.max(8, Number(tab.terminal?.cols || 80));
         const mirror = new window.Terminal({ disableStdin:true, cursorBlink:false, convertEol:true, allowProposedApi:true, cols, rows:24, scrollback:20000, fontSize:13, theme:{ background:'#0b1119', foreground:'#d8e4f0' } });
         const host = document.createElement('div');

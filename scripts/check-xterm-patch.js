@@ -35,6 +35,14 @@ if (!hasWheelLocal) {
   ok = false;
 }
 
+// 补丁 3：备用缓冲区历史累积到主缓冲区（Codex 运行中可上翻）。
+// 累积方法 _nextermAccumAltLine/_nextermFlushAltText 与 scroll() 钩子应进入产物。
+const hasAltAccum = code.includes('_nextermAccumAltLine') && code.includes('_nextermFlushAltText');
+if (!hasAltAccum) {
+  console.error('[check-xterm-patch] 补丁 3（备用缓冲区历史累积）未进入产物：未发现 _nextermAccumAltLine/_nextermFlushAltText');
+  ok = false;
+}
+
 // 语法解析：优先 esbuild（若可用），否则用 new Function 粗校验 IIFE 可解析。
 if (ok) {
   let parsed = false;

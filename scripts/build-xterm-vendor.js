@@ -62,7 +62,8 @@ function verifyOutput(file) {
     const source = path.join(tmp, 'package');
     const bufferSetFile = path.join(source, 'src', 'common', 'buffer', 'BufferSet.ts');
     const terminalFile = path.join(source, 'src', 'browser', 'Terminal.ts');
-    if (!fs.existsSync(bufferSetFile) || !fs.existsSync(terminalFile)) fail('xterm 源码缺少 BufferSet.ts 或 Terminal.ts');
+    const bufferServiceFile = path.join(source, 'src', 'common', 'services', 'BufferService.ts');
+    if (!fs.existsSync(bufferSetFile) || !fs.existsSync(terminalFile) || !fs.existsSync(bufferServiceFile)) fail('xterm 源码缺少 BufferSet.ts / Terminal.ts / BufferService.ts');
 
     // ---- 补丁 1：备用缓冲区保留 scrollback ----
     // BufferSet.reset() 中：this._alt = new Buffer(false, ...) 的 false 即
@@ -76,7 +77,19 @@ function verifyOutput(file) {
     bufferSet = bufferSet.replace(bsAnchor, bsPatch, 1);
     fs.writeFileSync(bufferSetFile, bufferSet);
 
-    // ---- 补丁 2：TUI 鼠标上报且有 alt scrollback 时，滚轮本地接管 ----
+    // ---- 补丁 3：备用缓冲区历史累积到主缓冲区（Codex 运行中可上翻）----
+    // 锚点与替换串集中在 scripts/xterm-patch3.js，避免在构建脚本里内联大段 TS 源码。
+    const p3 = require(path.join(__dirname, 'xterm-patch3.js'));
+    let bufferService = fs.readFileSync(bufferServiceFile, 'utf8');
+    for (const [name, anchor] of [['state', p3.stateAnchor], ['scroll', p3.scrollAnchor], ['method', p3.methodAnchor]]) {
+      if (!bufferService.includes(anchor)) fail('xterm BufferService.ts 补丁 3 ' + name + ' 锚点未找到，请核对 xterm 版本');
+    }
+    bufferService = bufferService.replace(p3.stateAnchor, p3.statePatch, 1);
+    bufferService = bufferService.replace(p3.scrollAnchor, p3.scrollPatch, 1);
+    bufferService = bufferService.replace(p3.methodAnchor, p3.methodPatch + p3.methodAnchor, 1);
+    fs.writeFileSync(bufferServiceFile, bufferService);
+
+        // ---- 补丁 2：TUI 鼠标上报且有 alt scrollback 时，滚轮本地接管 ----
     // Terminal 的 wheel 处理里，若 _customWheelEventHandler 拒绝（返回 false）
     // 或 amount===0 会 return false，事件继续冒泡到 Viewport 的 onwheel，由
     // 其执行本地 scrollLines（xterm 自身"滚轮翻页"路径）。Codex 开着鼠标上报
