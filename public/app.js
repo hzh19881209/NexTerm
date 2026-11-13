@@ -162,7 +162,7 @@
     const style = serverColor ? ` style="--connection-color:${serverColor}"` : '';
     return `<svg class="connection-icon ${connected ? 'connected' : 'disconnected'}${attention ? ' attention' : ''}${auto ? ' auto' : ''}${serverColor ? ' has-server-color' : ''}"${style} viewBox="0 0 24 24" role="img" aria-label="${auto ? '自动审批已开启（点击关闭）' : '点击开启自动审批'}"><path class="connection-bolt" d="M13.7 2.5 5.4 13.3h6.2l-1.3 8.2 8.3-11h-6.2l1.3-8Z"/>${connected ? '' : '<path class="connection-slash" d="M4.5 4.5 19.5 19.5"/>'}</svg>`;
   };
-  const CLIENT_BUILD_TAG = 'nexterm-evolution-47-tab-codex-transcript-reconstruct';
+  const CLIENT_BUILD_TAG = 'nexterm-evolution-48-tab-codex-alt-scrollback';
   const notify = (message, type = 'info') => {
     const toast = document.createElement('div'); toast.textContent = message; toast.style.cssText = `position:fixed;right:18px;bottom:18px;z-index:30;background:${type === 'error' ? '#4d2029' : '#17372f'};border:1px solid ${type === 'error' ? '#9d4656' : '#2b8067'};color:#e8fff7;padding:11px 14px;border-radius:9px;font-size:13px;box-shadow:0 10px 30px #0005`;
     document.body.appendChild(toast); setTimeout(() => toast.remove(), 3000);
@@ -1917,33 +1917,7 @@ function closeTab(tabId) { const tab = state.tabs.get(tabId); if (!tab) return; 
       });
       if (tab.id === state.activeTab) requestAnimationFrame(() => requestAnimationFrame(() => { if (!view.classList.contains('hidden')) { fitTerminal(tab); sendResize(tab); scrollTerminalToBottom(tab, true); } }));
       tab.terminal.onData((data) => { if (tab.restoring) return; tab.followOutput = true; if (tab.ws?.readyState === WebSocket.OPEN) tab.ws.send(JSON.stringify({ type:'input', data:btoa(unescape(encodeURIComponent(data))) })); if (!terminalAtBottom(tab)) requestAnimationFrame(() => { if (tab.followOutput !== false && !terminalUserScrolling(tab)) { tab.terminal?.scrollToBottom?.(); tab.terminal?.refresh(0, Math.max(0, tab.terminal.rows - 1)); } }); });
-      // Codex/full-screen TUIs live on the alternate buffer, which xterm wipes
-      // on exit - so the finished transcript is lost and cannot be paged up.
-      // xterm 5.5 exposes no public onBufferChange on Terminal, so track the
-      // buffer type from onRender (fires on every frame, including buffer
-      // switches that onScroll misses) to know when the TUI starts and ends,
-      // which drives the byte-capture + offline transcript reconstruction.
-      let lastBufferType = '';
-      const trackTerminalBuffer = () => {
-        if (tab.restoring) return;
-        const buffer = tab.terminal?.buffer?.active;
-        if (!buffer) return;
-        const type = buffer.type;
-        if (type === lastBufferType) return;
-        const wasAlternate = lastBufferType === 'alternate';
-        lastBufferType = type;
-        if (type === 'alternate') {
-          // Entering the TUI: start capturing its byte stream for the
-          // transcript we will reconstruct on exit.
-          altStartSession();
-          return;
-        }
-        // Just returned to the main buffer: the write-hook has already
-        // reconstructed and injected the transcript as scrollback (via
-        // altEndSession), so the existing wheel takeover can page up through
-        // the finished Codex conversation.
-        if (wasAlternate && altPageState.active) altEndSession();
-      };
+
       // Scrolling the scrollback has to win against the live tail, otherwise the
       // view snaps back down on the next output chunk and upward wheel/touch
       // motion looks completely dead.  That fight is decided here:
@@ -1990,96 +1964,7 @@ function closeTab(tabId) { const tab = state.tabs.get(tabId); if (!tab) return; 
         return pixels;
       };
       const useLocalHistoryScroll = () => terminalUsesMouseReporting(tab) && terminalScrollbackAvailable(tab);
-      // Codex (and any full-screen TUI) paints in place on the alternate
-      // buffer, which never accumulates scrollback, and xterm's wheel handler
-      // rewrites the viewport every frame - so the buffer cannot be paged
-      // while the TUI is on screen.  The working fix: capture the raw byte
-      // stream for the whole alt session (onWriteParsed does not expose the
-      // string, so we wrap terminal.write), then - the moment the TUI exits -
-      // replay those bytes into a detached terminal and read the lines from
-      // (viewportY - a few rows) down to the tail.  In-place repaints collapse
-      // naturally, leaving a clean conversation, which we inject into the
-      // shell's real main buffer as genuine scrollback the existing wheel
-      // takeover can page through.
-      const altPageState = { bytes:null, active:false, lastType:'', mirror:null, mirrorHost:null };
-      const altAppendBytes = (text) => {
-        if (!altPageState.active || !text) return;
-        if (!altPageState.bytes) altPageState.bytes = '';
-        altPageState.bytes += text;
-        if (altPageState.bytes.length > 1572864) altPageState.bytes = altPageState.bytes.slice(-786432);
-      };
-      const altStartSession = () => {
-        if (altPageState.active) return;
-        altPageState.active = true;
-        altPageState.bytes = '';
-        clearAltPagingMirror();
-      };
-      const clearAltPagingMirror = () => {
-        if (altPageState.mirror) { try { altPageState.mirror.dispose(); } catch { /* mirror gone */ } altPageState.mirror = null; }
-        if (altPageState.mirrorHost) { try { altPageState.mirrorHost.remove(); } catch { /* host gone */ } altPageState.mirrorHost = null; }
-      };
-      const altEndSession = () => {
-        if (!altPageState.active) return;
-        altPageState.active = false;
-        const bytes = altPageState.bytes;
-        altPageState.bytes = null;
-        if (!bytes || !window.Terminal) { clearAltPagingMirror(); return; }
-        // Reconstruct the conversation offline, then inject it as scrollback.
-        const cols = Math.max(8, Number(tab.terminal?.cols || 80));
-        const mirror = new window.Terminal({ disableStdin:true, cursorBlink:false, convertEol:true, allowProposedApi:true, cols, rows:24, scrollback:20000, fontSize:13, theme:{ background:'#0b1119', foreground:'#d8e4f0' } });
-        const host = document.createElement('div');
-        host.style.cssText = 'position:absolute;left:-100000px;top:0;width:' + cols * 8 + 'px;height:408px;pointer-events:none;';
-        document.body.appendChild(host);
-        altPageState.mirror = mirror;
-        altPageState.mirrorHost = host;
-        try { mirror.open(host); } catch { clearAltPagingMirror(); return; }
-        mirror.attachCustomWheelEventHandler(() => false);
-        const finish = () => {
-          try {
-            const buffer = mirror.buffer?.active;
-            const lines = [];
-            if (buffer) {
-              // Read from the very top of the mirror's accumulated scrollback
-              // to the tail: in-place repaints collapse, leaving the clean
-              // conversation that has scrolled through the TUI this session.
-              const from = 0;
-              const to = Number(buffer.length || 0);
-              for (let index = from; index < to; index += 1) {
-                const line = buffer.getLine(index);
-                lines.push(line ? line.translateToString(true) : '');
-              }
-            }
-            const text = lines.join('\r\n');
-            if (text) {
-              tab.terminal.write(text + '\r\n');
-              requestAnimationFrame(() => { if (!terminalUserScrolling(tab)) tab.terminal?.scrollToBottom?.(); });
-            }
-          } catch { /* reconstruction failed */ }
-          clearAltPagingMirror();
-          if (tab.id === state.activeTab) fitTerminal(tab);
-        };
-        mirror.write(bytes, () => { setTimeout(finish, 60); });
-      };
-      // xterm's onWriteParsed does not expose the written string, so we wrap
-      // terminal.write to capture the raw bytes ourselves.  While the alt
-      // buffer is active we accumulate them; on exit altEndSession replays
-      // them into a detached terminal and injects the result as scrollback.
-      const rawTerminalWrite = tab.terminal.write.bind(tab.terminal);
-      tab.terminal.write = (data, callback) => {
-        let text = '';
-        try { text = typeof data === 'string' ? data : (data ? new TextDecoder().decode(data) : ''); } catch { text = ''; }
-        if (text && !tab.restoring) {
-          const type = tab.terminal?.buffer?.active?.type;
-          if (type === 'alternate') {
-            altStartSession();
-            altAppendBytes(text);
-          } else if (altPageState.active) {
-            altEndSession();
-          }
-        }
-        if (typeof callback === 'function') return rawTerminalWrite(data, callback);
-        return rawTerminalWrite(data);
-      };
+
       const scheduleMomentum = () => {
         if (scrollState.momentumFrame) return;
         scrollState.momentumFrame = requestAnimationFrame(() => {
@@ -2185,7 +2070,6 @@ function closeTab(tabId) { const tab = state.tabs.get(tabId); if (!tab) return; 
         terminalElement.addEventListener('touchcancel', endTouch, { capture:true, passive:true });
       }
       attachViewportFollow();
-      tab.terminal.onRender(() => { trackTerminalBuffer(); });
       tab.terminal.onScroll(() => { attachViewportFollow(); syncTerminalFollowFromViewport(); });
       new MutationObserver(attachViewportFollow).observe(terminalElement, { childList:true, subtree:true });
       terminalElement.addEventListener('paste', async (event) => {
