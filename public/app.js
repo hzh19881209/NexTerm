@@ -162,7 +162,7 @@
     const style = serverColor ? ` style="--connection-color:${serverColor}"` : '';
     return `<svg class="connection-icon ${connected ? 'connected' : 'disconnected'}${attention ? ' attention' : ''}${auto ? ' auto' : ''}${serverColor ? ' has-server-color' : ''}"${style} viewBox="0 0 24 24" role="img" aria-label="${auto ? '自动审批已开启（点击关闭）' : '点击开启自动审批'}"><path class="connection-bolt" d="M13.7 2.5 5.4 13.3h6.2l-1.3 8.2 8.3-11h-6.2l1.3-8Z"/>${connected ? '' : '<path class="connection-slash" d="M4.5 4.5 19.5 19.5"/>'}</svg>`;
   };
-  const CLIENT_BUILD_TAG = 'nexterm-evolution-48-tab-codex-alt-scrollback';
+  const CLIENT_BUILD_TAG = 'nexterm-evolution-49-tab-codex-exit-replay';
   const notify = (message, type = 'info') => {
     const toast = document.createElement('div'); toast.textContent = message; toast.style.cssText = `position:fixed;right:18px;bottom:18px;z-index:30;background:${type === 'error' ? '#4d2029' : '#17372f'};border:1px solid ${type === 'error' ? '#9d4656' : '#2b8067'};color:#e8fff7;padding:11px 14px;border-radius:9px;font-size:13px;box-shadow:0 10px 30px #0005`;
     document.body.appendChild(toast); setTimeout(() => toast.remove(), 3000);
@@ -1964,6 +1964,79 @@ function closeTab(tabId) { const tab = state.tabs.get(tabId); if (!tab) return; 
         return pixels;
       };
       const useLocalHistoryScroll = () => terminalUsesMouseReporting(tab) && terminalScrollbackAvailable(tab);
+      // 方案 B（退出后离线重建）：Codex 用 clear+绝对定位原地重绘备用缓冲区，
+      // 从不让行滚出屏幕，因此 alt-scrollback 对 Codex 本体不积累历史、运行中
+      // 无法上翻。这里把整段备用缓冲区会话的原始字节流抓下来，退出 TUI 的瞬间
+      // 重放进一个离屏终端离线重建（原地重绘自然折叠成干净对话），再把结果写入
+      // shell 真实主缓冲区成为 scrollback，既有滚轮本地接管即可上翻整段 Codex 会话。
+      // 与方案 A 的 xterm 核心 alt-scrollback 互不干扰：A 负责"会向上滚动的 TUI"，
+      // B 负责"Codex 这类原地重绘 TUI 的退出后回看"。
+      const codexReplay = { bytes:'', active:false, mirror:null, mirrorHost:null };
+      const codexReplayAppend = (text) => {
+        if (!codexReplay.active || !text) return;
+        codexReplay.bytes += text;
+        if (codexReplay.bytes.length > 1572864) codexReplay.bytes = codexReplay.bytes.slice(-786432);
+      };
+      const codexReplayStart = () => {
+        if (codexReplay.active) return;
+        codexReplay.active = true;
+        codexReplay.bytes = '';
+        codexReplayClearMirror();
+      };
+      const codexReplayClearMirror = () => {
+        if (codexReplay.mirror) { try { codexReplay.mirror.dispose(); } catch { /* mirror gone */ } codexReplay.mirror = null; }
+        if (codexReplay.mirrorHost) { try { codexReplay.mirrorHost.remove(); } catch { /* host gone */ } codexReplay.mirrorHost = null; }
+      };
+      const codexReplayEnd = () => {
+        if (!codexReplay.active) return;
+        codexReplay.active = false;
+        const bytes = codexReplay.bytes;
+        codexReplay.bytes = '';
+        if (!bytes || !window.Terminal) { codexReplayClearMirror(); return; }
+        const cols = Math.max(8, Number(tab.terminal?.cols || 80));
+        const mirror = new window.Terminal({ disableStdin:true, cursorBlink:false, convertEol:true, allowProposedApi:true, cols, rows:24, scrollback:20000, fontSize:13, theme:{ background:'#0b1119', foreground:'#d8e4f0' } });
+        const host = document.createElement('div');
+        host.style.cssText = 'position:absolute;left:-100000px;top:0;width:' + cols * 8 + 'px;height:408px;pointer-events:none;';
+        document.body.appendChild(host);
+        codexReplay.mirror = mirror;
+        codexReplay.mirrorHost = host;
+        try { mirror.open(host); } catch { codexReplayClearMirror(); return; }
+        mirror.attachCustomWheelEventHandler(() => false);
+        const finish = () => {
+          try {
+            const buffer = mirror.buffer?.active;
+            const lines = [];
+            if (buffer) {
+              const to = Number(buffer.length || 0);
+              for (let index = 0; index < to; index += 1) {
+                const line = buffer.getLine(index);
+                lines.push(line ? line.translateToString(true) : '');
+              }
+            }
+            const text = lines.join('\r\n');
+            if (text) {
+              tab.terminal.write(text + '\r\n');
+              requestAnimationFrame(() => { if (!terminalUserScrolling(tab)) tab.terminal?.scrollToBottom?.(); });
+            }
+          } catch { /* reconstruction failed */ }
+          codexReplayClearMirror();
+          if (tab.id === state.activeTab) fitTerminal(tab);
+        };
+        mirror.write(bytes, () => { setTimeout(finish, 60); });
+      };
+      // 包裹 terminal.write 捕获字节流（xterm onWriteParsed 不暴露写入字符串）。
+      const codexRawWrite = tab.terminal.write.bind(tab.terminal);
+      tab.terminal.write = (data, callback) => {
+        let text = '';
+        try { text = typeof data === 'string' ? data : (data ? new TextDecoder().decode(data) : ''); } catch { text = ''; }
+        if (text && !tab.restoring) {
+          const type = tab.terminal?.buffer?.active?.type;
+          if (type === 'alternate') { codexReplayStart(); codexReplayAppend(text); }
+          else if (codexReplay.active) codexReplayEnd();
+        }
+        if (typeof callback === 'function') return codexRawWrite(data, callback);
+        return codexRawWrite(data);
+      };
 
       const scheduleMomentum = () => {
         if (scrollState.momentumFrame) return;
